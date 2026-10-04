@@ -3,10 +3,15 @@ import '../dist/fp400-zone-card.js';
 // URL options: prefix=<device> · auto (find the device) · device=<name in the card config> · latency=<ms> · tick=<ms> · phone
 // noblocks (no area controls) · oldconv (the 0.1.0 converter: ignore spots only, no counts, no remove_target)
 // rotation=<deg> (map turned, converter 0.3) · offline (Zigbee2MQTT down: every entity unavailable)
+// registry (Home Assistant shares its entity registry) · renamed (zone 1's entity IDs renamed by HA, found via the registry)
+// held (no new positions; zones held by the sensor's own presence)
 const params=new URLSearchParams(location.search),old=params.has('oldconv');
 const device=params.get('prefix')??'0x54ef440000000001',card=document.querySelector('fp400-zone-card'),states={};
 if(params.has('phone'))document.querySelector('main').className='phone';
-const set=(domain,key,state,attributes={})=>states[`${domain}.${device}_${key}`]={state,attributes};
+// Entity IDs, and the Zigbee2MQTT key behind each one (what the registry's unique ID says).
+const idOf={},keyOf={},ieee='0x54ef440000000001';
+if(params.has('renamed'))for(const [d,k,n] of [['text','software_zone_1_config','kitchen_zone_configuration'],['binary_sensor','software_zone_1_occupancy','kitchen_occupancy'],['binary_sensor','software_zone_1_available','kitchen_tracking_available'],['sensor','software_zone_1_count','kitchen_people'],['sensor','software_zone_1_activity','kitchen_activity']])idOf[`${d}.${k}`]=`${d}.kitchen_fp400_${n}`;
+const set=(domain,key,state,attributes={})=>{const id=idOf[`${domain}.${key}`]??`${domain}.${device}_${key}`;keyOf[id]=key;states[id]={state,attributes};};
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 for(let i=1;i<=8;i++){set('text',`software_zone_${i}_config`,'clear');set('binary_sensor',`software_zone_${i}_occupancy`,'off');set('binary_sensor',`software_zone_${i}_available`,'on');if(!old){set('sensor',`software_zone_${i}_count`,'unknown');set('sensor',`software_zone_${i}_activity`,'unknown');}}
 set('text','software_zone_1_config',JSON.stringify({name:'Desk',x_min:-115,x_max:85,y_min:-19,y_max:131,absence_timeout:3}));
@@ -28,7 +33,7 @@ if(!params.has('nosettings')){
 // and Home Assistant's service call returns before that work finishes.
 const AREAS=['interference','entry_exit','edge'],types=params.has('noblocks')?[]:old?['interference']:AREAS;
 const masks=Object.fromEntries(AREAS.map(t=>[t,new Uint8Array(40)]));
-const sim=window.__sim={latency:Number(params.get('latency')??400),fail:false,keepTargets:false,calls:[],shapes:[]};
+const sim=window.__sim={latency:Number(params.get('latency')??400),fail:false,keepTargets:false,calls:[],shapes:[],ws:[]};
 const maskHex=t=>[...masks[t]].map(b=>b.toString(16).padStart(2,'0')).join('');
 function cellBits(r){
     const r0=Math.max(0,Math.floor(r.y_min/50)),r1=Math.min(19,Math.ceil(r.y_max/50)-1);
@@ -57,7 +62,7 @@ async function convert(type,op,value){
 const hass={states,user:{is_admin:false},callService:async(domain,service,data)=>{
     sim.calls.push({domain,service,...data});
     await sleep(20);
-    const id=data.entity_id,key=id.slice(id.indexOf('.')+device.length+2),type=AREAS.find(t=>key.startsWith(`${t}_`));
+    const id=data.entity_id,key=keyOf[id]??id.slice(id.indexOf('.')+device.length+2),type=AREAS.find(t=>key.startsWith(`${t}_`));
     const later=fn=>sleep(sim.latency).then(()=>{if(sim.fail)return;fn();card.hass={...hass};});
     if(domain==='text'&&type)convert(type,key.slice(type.length+1),data.value);
     else if(key==='remove_target')later(()=>{states[id]={state:data.value,attributes:{}};if(!sim.keepTargets)set('sensor','targets_xy',states[`sensor.${device}_targets_xy`].state.split(';').filter(t=>t.split(':')[0]!==data.value).join(';')||'none');});
@@ -68,7 +73,16 @@ const hass={states,user:{is_admin:false},callService:async(domain,service,data)=
     else later(()=>{states[id]={state:data.value,attributes:{}};});
 }};
 if(params.has('offline'))for(const id of Object.keys(states))states[id]={state:'unavailable',attributes:states[id].attributes};
+if(params.has('registry')||params.has('renamed')){
+    hass.entities=Object.fromEntries(Object.keys(keyOf).map(id=>[id,{entity_id:id,platform:'mqtt',device_id:'fp400'}]));
+    hass.callWS=async msg=>{
+        sim.ws.push(msg.type);
+        if(msg.type!=='config/entity_registry/get_entries')throw new Error('Unauthorized');
+        return Object.fromEntries(msg.entity_ids.map(id=>[id,keyOf[id]?{entity_id:id,unique_id:`${ieee}_${keyOf[id]}_zigbee2mqtt`,device_id:'fp400',platform:'mqtt'}:null]));
+    };
+}
+if(params.has('held')){set('sensor','tracking_status','held');set('binary_sensor','software_zone_1_available','on');}
 card.setConfig(params.has('auto')?{}:{device:params.get('device')??device});
-function update(){if(!params.has('offline'))set('sensor','tracking_last_update',new Date().toISOString());card.hass={...hass};}
+function update(){if(!params.has('offline'))set('sensor','tracking_last_update',params.has('held')?'2026-10-04T10:00:00.000Z':new Date().toISOString());card.hass={...hass};}
 update();setInterval(update,Number(params.get('tick')??3000));
 </script></body></html>

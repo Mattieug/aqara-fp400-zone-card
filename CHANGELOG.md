@@ -7,6 +7,18 @@ To update, get the new card through HACS and copy the new `z2m/aqara-fp400.mjs` 
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-04
+
+### Fixed
+
+- Zones no longer flip to "unknown" whenever positions pause ([#2](https://github.com/bobtekkk/aqara-fp400-zone-card/issues/2)). Some sensors only send positions while someone moves. Now, when positions pause, zones follow the sensor's own presence: an empty room empties every zone (with leave events), and while someone is there, zones keep their last state. They are only "unknown" when the sensor has sent neither. `tracking_status` then shows `held`, and the card says **Positions paused**.
+- The card finds its entities even after Home Assistant renamed them, for example when you rename the sensor in Home Assistant and let it update entity IDs ([#2](https://github.com/bobtekkk/aqara-fp400-zone-card/issues/2)). It now looks them up by Zigbee2MQTT's fixed unique IDs.
+- A movement value other than 1 (moving) or 2 (still) — one sensor sent 11 — now leaves the zone's activity unknown instead of reporting "still". Thanks to [@vize69](https://github.com/vize69) for the report, the analysis and the regression tests.
+
+### Changed
+
+- `tracking_status` has two new values: `partial` (the coordinator cut the last report, so missing targets are kept where they were last seen) and `held` (no new positions; zones follow the sensor's own presence).
+
 ## [0.3.0] - 2026-10-02
 
 ### Added
@@ -64,7 +76,8 @@ To update, get the new card through HACS and copy the new `z2m/aqara-fp400.mjs` 
 - Interference blocks, written to the sensor's own interference area.
 - Zigbee2MQTT converter (`z2m/aqara-fp400.mjs`): software zones, interference blocks, position tracking and the sensor's settings.
 
-[Unreleased]: https://github.com/bobtekkk/aqara-fp400-zone-card/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/bobtekkk/aqara-fp400-zone-card/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/bobtekkk/aqara-fp400-zone-card/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/bobtekkk/aqara-fp400-zone-card/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/bobtekkk/aqara-fp400-zone-card/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/bobtekkk/aqara-fp400-zone-card/compare/v0.1.0...v0.2.0

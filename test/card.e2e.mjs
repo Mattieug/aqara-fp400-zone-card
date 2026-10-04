@@ -509,6 +509,25 @@ const scenarios = {
         check('RD2 the live badge explains missing positions', /position reports/.test(r.live), r);
         noErrors('RD3', page); await page.close();
     },
+    async RE() { // issue #2 follow-up: Home Assistant renamed zone 1's entity IDs (sensor renamed in HA)
+        const page = await open('?renamed=1&latency=100');
+        const r = await page.evaluate(() => { const c = document.querySelector('fp400-zone-card'); return {desk: c.drafts[1]?.name, loaded: c.loaded.size, id: c.entity('text', 'software_zone_1_config'), ws: window.__sim.ws}; });
+        check('RE1 the card finds the renamed zone through the entity registry', r.desk === 'Desk' && r.loaded === 8 && r.id === 'text.kitchen_fp400_kitchen_zone_configuration' && r.ws.includes('config/entity_registry/get_entries'), r);
+        await page.locator('fp400-zone-card .zone-row[data-zone="1"]').click();
+        await page.locator('fp400-zone-card input[data-field="name"]').fill('Kitchen'); await page.locator('fp400-zone-card input[data-field="name"]').press('Enter');
+        await btn(page, 'save').click(); await waitIdle(page);
+        const call = await page.evaluate(() => window.__sim.calls.at(-1));
+        const s = await st(page);
+        check('RE2 saving writes to the renamed entity and is confirmed', call.entity_id === 'text.kitchen_fp400_kitchen_zone_configuration' && /"name":"Kitchen"/.test(call.value) && /^Saved/.test(s.message), {call, message: s.message});
+        noErrors('RE3', page); await page.close();
+    },
+    async RF() { // positions paused: zones keep showing what the converter holds, not "Waiting for positions"
+        const page = await open('?held=1');
+        const r = await page.evaluate(() => { const q = s => document.querySelector('fp400-zone-card').shadowRoot.querySelector(s); return {pill: q('#live').textContent.trim(), tip: q('#live').title, row: q('.zone-row[data-zone="1"] small').textContent}; });
+        check('RF1 the badge says positions are paused and explains it', r.pill === 'Positions paused' && /keep their last state/.test(r.tip), r);
+        check('RF2 the zone still shows its held state', /^Occupied/.test(r.row), r);
+        noErrors('RF3', page); await page.close();
+    },
     async Z() { // zone rows show how many people and whether they move
         const page = await open();
         const row = await page.locator('fp400-zone-card .zone-row[data-zone="1"] small').textContent();

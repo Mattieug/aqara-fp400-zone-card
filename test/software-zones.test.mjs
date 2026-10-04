@@ -21,7 +21,7 @@ test('a report cut short keeps missing targets where they were last seen',()=>{
  t.accept([{id:1,x:0,y:80,activity:2},{id:2,x:50,y:250,activity:1}],0);
  t.accept([{id:1,x:0,y:80,activity:2},{id:7,x:-300,y:600,activity:2},{id:8,x:300,y:900,activity:2}],1000,4); // id 2 did not arrive
  let s=t.state(9000);
- assert.deepEqual([s.software_zone_2_occupancy,s.software_zone_2_count,s.software_zone_2_activity,s.tracking_status],[true,1,'moving','valid']);
+ assert.deepEqual([s.software_zone_2_occupancy,s.software_zone_2_count,s.software_zone_2_activity,s.tracking_status],[true,1,'moving','partial']);
  t.accept([{id:1,x:0,y:80,activity:2}],10000); // a complete report without id 2: it is gone
  s=t.state(13000);
  assert.deepEqual([s.software_zone_1_occupancy,s.software_zone_2_occupancy,s.software_zone_2_count],[true,false,0]);
@@ -120,4 +120,25 @@ test('a zone drawn on a turned map checks targets in its own frame',()=>{
  const t=new SoftwareZoneTracker({1:z});t.accept([{id:1,x:-250,y:50}],0);assert.equal(t.state(0).software_zone_1_occupancy,true);
  assert.equal('rotation' in parseSoftwareZone({name:'Bed',x_min:0,x_max:100,y_min:200,y_max:300,rotation:0}),false);
  assert.throws(()=>parseSoftwareZone({name:'Bed',x_min:0,x_max:100,y_min:200,y_max:300,rotation:181}),/rotation/);
+});
+test('when positions pause, the sensor\'s own presence keeps the zones: held while someone is there, empty when nobody is',()=>{
+ const t=new SoftwareZoneTracker({1:desk});
+ t.accept([{id:1,x:0,y:80,activity:2}],0);
+ assert.equal(t.state(31000).software_zone_1_occupancy,null,'no positions and no presence: unknown');
+ t.setPresence(true,31000);
+ let s=t.state(60000);
+ assert.deepEqual([s.software_zone_1_occupancy,s.software_zone_1_count,s.software_zone_1_activity,s.software_zone_1_available,s.tracking_status],[true,1,'still',true,'held']);
+ assert.deepEqual(t.setPresence(false,61000),[{zone:1,type:'leave'}]);
+ s=t.state(62000);
+ assert.deepEqual([s.software_zone_1_occupancy,s.software_zone_1_count,s.software_zone_1_available,s.tracking_status],[false,0,true,'held']);
+ t.reset(1);assert.equal(t.state(63000).software_zone_1_occupancy,false,'a zone edited in an empty room is empty at once');
+ t.accept([{id:2,x:0,y:80,activity:1}],64000);assert.equal(t.state(64000).software_zone_1_occupancy,true,'fresh positions win again');
+});
+test('activity: moving if anyone moves, still only if everyone sends 2, otherwise unknown (raw 11 seen on one unit)',()=>{
+ const t=new SoftwareZoneTracker({1:desk}),act=targets=>{t.accept(targets,0);return t.state(0).software_zone_1_activity;};
+ assert.equal(act([{id:1,x:0,y:80,activity:11}]),null);
+ assert.equal(t.state(0).software_zone_1_occupancy,true,'the zone is still occupied');
+ assert.equal(act([{id:1,x:0,y:80,activity:2},{id:2,x:10,y:80,activity:11}]),null);
+ assert.equal(act([{id:1,x:0,y:80,activity:1},{id:2,x:10,y:80,activity:11}]),'moving');
+ assert.equal(act([{id:1,x:0,y:80,activity:2},{id:2,x:10,y:80,activity:2}]),'still');
 });

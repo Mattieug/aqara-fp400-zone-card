@@ -1,5 +1,5 @@
 /* Aqara FP400 zone card for Home Assistant + Zigbee2MQTT. https://github.com/bobtekkk/aqara-fp400-zone-card (MIT License) */
-const VERSION = '0.3.0';
+const VERSION = '0.4.0';
 const COLORS = ['#67e4b8','#9fa9ff','#f9bf73','#f28fad','#68cce8','#d6a0ef','#bddb79','#ff9d7a'];
 const LIMITS = {x_min:-400,x_max:400,y_min:-50,y_max:1000};
 // The sensor's own area masks, in sidebar order. The map draws them in reverse, so ignore spots end up on top.
@@ -144,6 +144,17 @@ export function findDevices(hass){
     return found;
 }
 export const findDevice=hass=>findDevices(hass)[0]??null;
+// FP400s in the entity registry. Zigbee2MQTT gives each entity the fixed unique ID <ieee>_<key>_zigbee2mqtt, so this
+// finds the card's entities even after Home Assistant renamed them (for example when the device was renamed).
+export function registryFp400s(entries){
+    const devices={};
+    for(const [entityId,e] of Object.entries(entries??{})){
+        const m=/^(0x[0-9a-f]{16})_(.+)_zigbee2mqtt$/.exec(e?.unique_id??'');if(!m)continue;
+        (devices[m[1]]??={ieee:m[1],keys:{}}).keys[`${entityId.split('.')[0]}.${m[2]}`]=entityId;
+    }
+    return Object.values(devices).filter(d=>d.keys['text.software_zone_1_config'])
+        .map(d=>({...d,label:/^text\.([a-z0-9_]+)_software_zone_1_config$/.exec(d.keys['text.software_zone_1_config'])?.[1]??d.ieee}));
+}
 export function clampBlock(r){
     const c={x_min:Math.max(-400,r.x_min),x_max:Math.min(400,r.x_max),y_min:Math.max(0,r.y_min),y_max:Math.min(1000,r.y_max)};
     return c.x_max-c.x_min>=50&&c.y_max-c.y_min>=50?c:null;
@@ -169,33 +180,50 @@ export class FP400ZoneCard extends (globalThis.HTMLElement ?? class {}) {
     setConfig(config){
         const device=config.device==null||config.device===''?null:String(config.device).toLowerCase();
         if(device!==null&&!/^[a-z0-9_]+$/.test(device))throw new Error('device must be the start of your FP400 entity IDs, for example living_room_fp400 or 0x54ef440000000001.');
-        this.config={...config,device};this.resolvedAt=0;this.resolveDevice();this.watchedFor=null;if(!this.mounted)this.mount();if(this._hass)this.sync();
+        this.config={...config,device};this.resolvedAt=0;this.resolveDevice();this.watchedFor=undefined;if(!this.mounted)this.mount();if(this._hass)this.sync();
     }
-    get device(){return this.resolved??this.config?.device;}
-    // Use the configured FP400, else the first one the converter made entities for. A configured one that Home Assistant
+    get device(){return this.fp?.label??this.config?.device??null;}
+    // The FP400s Home Assistant knows: from the entity registry once it was read, else by their usual entity IDs.
+    candidates(){return this.registry??findDevices(this._hass).map(label=>({ieee:null,label,keys:null}));}
+    // Use the configured FP400 (its name or IEEE address), else the first one. A configured one that Home Assistant
     // doesn't have (renamed sensor) is replaced by the only other FP400, and the card says so.
     resolveDevice(){
-        const wanted=this.config?.device??null,before=this.resolved;
-        if(!this._hass?.states){this.resolved=wanted;return;}
-        const found=findDevices(this._hass);this.resolvedAt=Date.now();
-        const missing=Boolean(wanted)&&found.length>0&&!found.includes(wanted);
-        this.resolved=missing&&found.length===1?found[0]:wanted??found[0]??null;
+        const wanted=this.config?.device??null,before=this.fp?.label;
+        if(!this._hass?.states){this.fp=wanted?{label:wanted,keys:null}:null;return;}
+        const found=this.candidates();this.resolvedAt=Date.now();
+        const named=c=>c.ieee===wanted||c.label===wanted||Boolean(c.keys&&Object.values(c.keys).some(id=>id.slice(id.indexOf('.')+1).startsWith(`${wanted}_`)));
+        const hit=wanted?found.find(named):found[0],missing=Boolean(wanted)&&!hit&&found.length>0;
+        this.fp=hit??(missing&&found.length===1?found[0]:wanted?{label:wanted,keys:null}:null);
         this.deviceNote=!missing?null:found.length===1
-            ?`This card is set to device: ${wanted}, which Home Assistant doesn't have (was the sensor renamed?). Showing ${found[0]} instead. Remove device: from the card, or change it.`
-            :`This card is set to device: ${wanted}, which Home Assistant doesn't have (was the sensor renamed?). Change device: to one of: ${found.join(', ')}.`;
-        if(before&&this.resolved!==before){this.saved={};this.drafts={};this.base={};this.dirty.clear();this.loaded.clear();this.firstFit=false;this.startedAt=null;}
+            ?`This card is set to device: ${wanted}, which Home Assistant doesn't have (was the sensor renamed?). Showing ${found[0].label} instead. Remove device: from the card, or change it.`
+            :`This card is set to device: ${wanted}, which Home Assistant doesn't have (was the sensor renamed?). Change device: to one of: ${found.map(c=>c.label).join(', ')}.`;
+        if(before&&this.fp?.label!==before){this.saved={};this.drafts={};this.base={};this.dirty.clear();this.loaded.clear();this.firstFit=false;this.startedAt=null;}
         if(this.deviceNote)this.notice(this.deviceNote,'error');
+    }
+    // Read the entity registry whenever Home Assistant's entity list changes (a rename, a new device): it maps
+    // Zigbee2MQTT's fixed unique IDs to the current entity IDs. Any user may read it; older versions fall back to names.
+    async loadRegistry(entities){
+        this.registryFor=entities;let registry=null;
+        try{
+            const mqtt=Object.values(entities).filter(e=>e.platform==='mqtt'),get=ids=>this._hass.callWS({type:'config/entity_registry/get_entries',entity_ids:ids});
+            const texts=await get(mqtt.filter(e=>e.entity_id.startsWith('text.')).map(e=>e.entity_id));
+            const devices=new Set(Object.values(texts).filter(e=>/_software_zone_1_config_zigbee2mqtt$/.test(e?.unique_id??'')).map(e=>e.device_id));
+            if(devices.size)registry=registryFp400s(await get(mqtt.filter(e=>devices.has(e.device_id)).map(e=>e.entity_id)));
+        }catch{/* entity IDs are guessed from the usual names */}
+        if(this.registryFor!==entities)return; // a newer read is under way
+        this.registry=registry?.length?registry:null;this.resolvedAt=0;this.resolveDevice();this.watchedFor=null;
+        if(this._hass)this.hass=this._hass;
     }
     getCardSize(){return 12;}
     getGridOptions(){return {columns:'full',min_columns:12};}
     // Home Assistant hands over a new hass object for every entity change in the house; only ours matter.
     set hass(value){
         this._hass=value;if(!this.config)return;
+        if(value.entities&&value.callWS&&value.entities!==this.registryFor)this.loadRegistry(value.entities);
         // Look again if our FP400's entities are missing, at most every 5 s: scanning every entity is not free.
-        if((!this.resolved||value.states?.[`text.${this.resolved}_software_zone_1_config`]===undefined)&&Date.now()-(this.resolvedAt??0)>5000)this.resolveDevice();
-        const device=this.device;
-        if(!device){this.notice('No FP400 found. Install the Zigbee2MQTT converter (see the README) or set device: in the card.','error');return;}
-        if(this.watchedFor!==device){this.watchedFor=device;this.watched=this.watchedEntities();this.seen=null;}
+        if((!this.fp||value.states?.[this.entity('text','software_zone_1_config')]===undefined)&&Date.now()-(this.resolvedAt??0)>5000)this.resolveDevice();
+        if(!this.device){this.notice('No FP400 found. Install the Zigbee2MQTT converter (see the README) or set device: in the card.','error');return;}
+        if(this.watchedFor!==this.fp){this.watchedFor=this.fp;this.watched=this.watchedEntities();this.seen=null;}
         let changed=!this.seen;this.seen??=new Map();
         for(const id of this.watched){const s=value.states?.[id];if(this.seen.get(id)!==s){this.seen.set(id,s);changed=true;}}
         if(changed)this.sync();
@@ -210,7 +238,7 @@ export class FP400ZoneCard extends (globalThis.HTMLElement ?? class {}) {
     get hass(){return this._hass;}
     connectedCallback(){this.clock??=setInterval(()=>{if(this.mounted)this.renderLive();},1000);if(this.mounted)this.resizeObs?.observe(this.svg);}
     disconnectedCallback(){clearInterval(this.clock);this.clock=null;clearTimeout(this.learnTimer);this.resizeObs?.disconnect();}
-    entity(domain,key){return `${domain}.${this.device}_${key}`;}
+    entity(domain,key){return this.fp?.keys?.[`${domain}.${key}`]??`${domain}.${this.device}_${key}`;}
     state(domain,key){return this._hass?.states?.[this.entity(domain,key)]?.state;}
     available(domain,key){return !['unavailable',undefined].includes(this.state(domain,key));}
     inside(selector){return this.shadowRoot.querySelector(selector).contains(this.shadowRoot.activeElement);}
@@ -268,7 +296,9 @@ export class FP400ZoneCard extends (globalThis.HTMLElement ?? class {}) {
         this.renderMap();this.renderLive();this.renderButtons();
     }
     targets(){return parseTargets(this.state('sensor','targets_xy'));}
-    fresh(){const time=Date.parse(this.state('sensor','tracking_last_update'));return this.state('sensor','tracking_status')==='valid' && Number.isFinite(time) && Date.now()-time<30000;}
+    fresh(){const time=Date.parse(this.state('sensor','tracking_last_update'));return ['valid','partial'].includes(this.state('sensor','tracking_status')) && Number.isFinite(time) && Date.now()-time<30000;}
+    // A zone shows a state whenever the converter has one (fresh positions, or held by the sensor's own presence).
+    zoneLive(id){return this.state('binary_sensor',`software_zone_${id}_available`)==='on';}
     notice(text,type=''){if(!this.mounted)return;const el=this.shadowRoot.querySelector('#message');el.textContent=text;el.className=`message ${type}`;}
     mark(id,z){if(!this.dirty.has(id))this.base[id]=clone(this.saved[id]);this.drafts[id]=z;if(sameZone(z,this.saved[id])){this.dirty.delete(id);delete this.base[id];}else this.dirty.add(id);this.notice(this.dirty.size?`${this.dirty.size} zone${this.dirty.size===1?'':'s'} with unsaved changes.`:'All changes are saved.');}
     action(action,el){
@@ -453,7 +483,7 @@ export class FP400ZoneCard extends (globalThis.HTMLElement ?? class {}) {
         for(const sel of ['#sensor-frame','#range'])this.shadowRoot.querySelector(sel).setAttribute('transform',`rotate(${this.rotation})`);
         this.shadowRoot.querySelector('#range-outline').setAttribute('visibility',this.rotation?'visible':'hidden'); // on a turned map the grid's edge is hard to see
         const shapes=Object.entries(this.drafts).filter(([,z])=>z).map(([id,z])=>{
-            const selected=Number(id)===this.selected,c=COLORS[id-1],dirty=this.dirty.has(Number(id)),occupied=!dirty&&this.state('binary_sensor',`software_zone_${id}_occupancy`)==='on'&&this.fresh();
+            const selected=Number(id)===this.selected,c=COLORS[id-1],dirty=this.dirty.has(Number(id)),occupied=!dirty&&this.state('binary_sensor',`software_zone_${id}_occupancy`)==='on'&&this.zoneLive(id);
             const w=z.x_max-z.x_min,h=z.y_max-z.y_min;
             const handles=selected?[[z.x_min,-z.y_max,'nw'],[z.x_max,-z.y_max,'ne'],[z.x_min,-z.y_min,'sw'],[z.x_max,-z.y_min,'se']].map(([x,y,corner])=>`<rect class="handle" data-handle="${corner}" x="${x-handle/2}" y="${y-handle/2}" width="${handle}" height="${handle}" rx="${1.5*scale}" fill="${c}" stroke="#10212a" stroke-width="1" vector-effect="non-scaling-stroke"/>`).join(''):'';
             const by=this.rotation-(z.rotation??0);
@@ -494,8 +524,10 @@ export class FP400ZoneCard extends (globalThis.HTMLElement ?? class {}) {
     renderLive(){
         if(!this.mounted)return;
         const fresh=this.fresh(),targets=fresh?this.targets():[],live=this.shadowRoot.querySelector('#live');
-        live.classList.toggle('fresh',fresh);live.querySelector('span').textContent=fresh?`Live · ${targets.length} target${targets.length===1?'':'s'}`:'Positions unavailable';
-        live.title=fresh?'':'No position reports from the sensor in the last 30 seconds. Check that the FP400 is online in Zigbee2MQTT. If this lasts, set Mounted on and Wall position in Settings.';
+        const held=!fresh&&this.state('sensor','tracking_status')==='held';
+        live.classList.toggle('fresh',fresh);live.querySelector('span').textContent=fresh?`Live · ${targets.length} target${targets.length===1?'':'s'}`:held?'Positions paused':'Positions unavailable';
+        live.title=fresh?'':held?'No new positions: nobody is moving, or the sensor paused them. Zones keep their last state while the sensor still detects someone, and empty when it detects nobody.'
+            :'No position reports from the sensor in the last 30 seconds. Check that the FP400 is online in Zigbee2MQTT. If this lasts, set Mounted on and Wall position in Settings.';
         const scale=this.view.width/700,seen=targets.find(t=>t.id===this.target);
         if(seen)this.targetAt={x:seen.x,y:seen.y};
         let html=targets.map(t=>{const sel=t.id===this.target,v=turn(t,-this.rotation);return `<g class="target" data-target="${t.id}"><circle class="hit" cx="${v.x}" cy="${-v.y}" r="${15*scale}" fill="${sel?'#ff6b7830':'#ffffff12'}"${sel?' stroke="#ff9aa5" stroke-width="1.5" vector-effect="non-scaling-stroke"':''}/><circle cx="${v.x}" cy="${-v.y}" r="${6*scale}" fill="#f6fbff" stroke="#142731" stroke-width="2" vector-effect="non-scaling-stroke"/><text x="${v.x+11*scale}" y="${-v.y-11*scale}" fill="#fff" font-size="${10*scale}">${t.id+1}</text></g>`;}).join('');
@@ -519,7 +551,7 @@ export class FP400ZoneCard extends (globalThis.HTMLElement ?? class {}) {
         const rows=[];
         for(let id=1;id<=8;id++){
             const z=this.drafts[id],removed=!z&&this.dirty.has(id)&&this.saved[id];if(!z&&!removed)continue;
-            const dirty=this.dirty.has(id),fresh=this.fresh()&&this.state('binary_sensor',`software_zone_${id}_available`)==='on',on=this.state('binary_sensor',`software_zone_${id}_occupancy`)==='on';
+            const dirty=this.dirty.has(id),fresh=this.zoneLive(id),on=this.state('binary_sensor',`software_zone_${id}_occupancy`)==='on';
             const count=Number(this.state('sensor',`software_zone_${id}_count`)),activity=this.state('sensor',`software_zone_${id}_activity`);
             const people=count>0?` · ${count} ${count===1?'person':'people'}${['moving','still'].includes(activity)?`, ${activity}`:''}`:'';
             rows.push({id,name:(z||removed).name,z,dot:!dirty&&fresh&&on,status:removed?'Will be removed':dirty?'Unsaved changes':!fresh?'Waiting for positions':on?`Occupied${people}`:'Empty'});

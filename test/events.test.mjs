@@ -51,6 +51,18 @@ test('a position report cut at 80 bytes (Ember) still updates the zones', () => 
     const device = {ieeeAddr: 'cut-test', meta: {fp400SoftwareZones: {1: desk}}};
     const cut = frame([{id: 0, x: -119, y: 217}, {id: 6, x: 58, y: 514}, {id: 2, x: 0, y: 80}, {id: 4, x: -30, y: 98}]).subarray(0, 80);
     const out = frames.convert({}, {endpoint: {ID: 1}, data: cut, device}, () => {});
-    assert.deepEqual([out.tracking_status, out.software_zone_1_occupancy, out.target_count, out.targets_xy], ['valid', true, 4, '0:-119:217;6:58:514;2:0:80']);
+    assert.deepEqual([out.tracking_status, out.software_zone_1_occupancy, out.target_count, out.targets_xy], ['partial', true, 4, '0:-119:217;6:58:514;2:0:80']);
     definition.onEvent({type: 'stop', data: {ieeeAddr: device.ieeeAddr}});
+});
+test('when the room empties, the zones empty too and fire leave events, even with no new positions', async () => {
+    const presence = definition.fromZigbee.find(c => c.cluster === 'msOccupancySensing' && c.type.includes('attributeReport') && c.convert.toString().includes('setPresence'));
+    const frames = definition.fromZigbee.find(c => c.cluster === 'aqaraFp400Location' && c.type.includes('raw'));
+    const device = {ieeeAddr: 'presence-test', meta: {fp400SoftwareZones: {1: desk}}}, published = [];
+    frames.convert({}, {endpoint: {ID: 1}, data: frame([{id: 3, x: 0, y: 80}]), device}, p => published.push(p));
+    const out = presence.convert({}, {endpoint: {ID: 1}, data: {occupancy: 0}, device}, p => published.push(p));
+    assert.deepEqual([out.software_zone_1_occupancy, out.software_zone_1_count], [false, 0]);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(published.filter(p => p.action), [{action: 'software_zone_1_leave'}]);
+    assert.equal(presence.convert({}, {endpoint: {ID: 3}, data: {occupancy: 0}, device}, () => {}), undefined, 'only endpoint 1 is the room');
+    await definition.onEvent({type: 'stop', data: {ieeeAddr: device.ieeeAddr}});
 });

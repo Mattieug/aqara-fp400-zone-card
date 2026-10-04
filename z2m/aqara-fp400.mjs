@@ -551,13 +551,14 @@ export function inZone(t, z) {
     return x >= z.x_min && x < z.x_max && y >= z.y_min && y < z.y_max;
 }
 export class SoftwareZoneTracker {
-    constructor(zones = {}) {this.zones=zones;this.lastAt=null;this.outsideSince={};this.occupied={};this.inside={};this.lastSeen=new Map();this.awaiting=new Set();this.invalid=false;}
+    constructor(zones = {}) {this.zones=zones;this.lastAt=null;this.outsideSince={};this.occupied={};this.inside={};this.lastSeen=new Map();this.awaiting=new Set();this.invalid=false;this.partial=false;this.presence=undefined;}
     // Returns the targets that entered or left each zone with this frame. When the report was cut short
     // (reported > targets.length), targets missing from it are assumed to stay where they were last seen;
     // if even that cannot account for every target, no zone starts counting down to empty.
     accept(targets, now, reported = targets.length) {
         this.lastAt=now;this.invalid=false;
         const decoded=new Set(targets.map(t=>t.id)),missing=reported-targets.length;
+        this.partial=missing>0;
         const carried=missing>0?[...this.lastSeen.values()].filter(t=>!decoded.has(t.id)).sort((a,b)=>b.at-a.at).slice(0,missing):[];
         const unaccounted=missing>carried.length;
         if (missing<=0) this.lastSeen.clear(); // a complete report is the whole truth
@@ -572,28 +573,42 @@ export class SoftwareZoneTracker {
                 for (const t of ids) if (!before.ids.has(t)) events.push({zone:Number(id),type:'enter'});
                 for (const t of before.ids) if (!ids.has(t)) events.push({zone:Number(id),type:'leave'});
             }
-            this.inside[id]={ids,moving:inside.some(t=>t.activity===1)};
+            this.inside[id]={ids,moving:inside.some(t=>t.activity===1),still:inside.length>0 && inside.every(t=>t.activity===2)};
         }
         this.awaiting.clear();
         return events;
     }
     // An edited zone waits for a fresh frame: positions from before the edit must not confirm it.
     reset(id) {delete this.outsideSince[id];delete this.occupied[id];delete this.inside[id];this.awaiting.add(Number(id));}
+    // The sensor's own room presence (endpoint 1). Positions pause when nobody moves, and on some units the stream
+    // only runs while someone does, so presence fills the gap: an empty room empties every zone (with leave events);
+    // while someone is there, zones keep what the last positions showed.
+    setPresence(occupied, now) {
+        this.presence={occupied,at:now};
+        if (occupied) return [];
+        const events=[];
+        for (const [id,inside] of Object.entries(this.inside)) for (const t of inside.ids) events.push({zone:Number(id),type:'leave'});
+        for (const id of Object.keys(this.zones)) {this.occupied[id]=false;this.inside[id]={ids:new Set(),moving:false,still:false};delete this.outsideSince[id];}
+        this.lastSeen.clear();
+        return events;
+    }
     state(now) {
         const fresh=this.lastAt!==null && now-this.lastAt<30000;
-        const usable=fresh && !this.invalid;
-        const result={tracking_status:!fresh?'stale':this.invalid?'invalid':'valid'};
+        const emptyRoom=!fresh && this.presence?.occupied===false, held=!fresh && this.presence?.occupied===true && this.lastAt!==null;
+        const usable=fresh ? !this.invalid : emptyRoom || held;
+        const result={tracking_status:fresh?(this.invalid?'invalid':this.partial?'partial':'valid'):emptyRoom || held?'held':'stale'};
         for (let id=1;id<=8;id++) {
             const z=this.zones[id], prefix=`software_zone_${id}`;
-            // Known once a report has shown someone in the zone or let it start counting down to empty.
-            const known=Boolean(z) && usable && !this.awaiting.has(id) && (this.occupied[id]!==undefined || this.outsideSince[id]!==undefined);
+            // Known once a report has shown someone in the zone or let it start counting down to empty, or when the room is empty.
+            const known=Boolean(z) && usable && (emptyRoom || (!this.awaiting.has(id) && (this.occupied[id]!==undefined || this.outsideSince[id]!==undefined)));
             if (known && this.outsideSince[id]!==undefined && now-this.outsideSince[id]>=z.absence_timeout*1000) this.occupied[id]=false;
+            const inside=emptyRoom ? undefined : this.inside[id], count=inside?.ids.size ?? 0;
             result[`${prefix}_config`]=z?JSON.stringify(z):'clear';
             result[`${prefix}_available`]=known;
-            result[`${prefix}_occupancy`]=known ? Boolean(this.occupied[id]) : null;
-            const count=this.inside[id]?.ids.size ?? 0;
+            result[`${prefix}_occupancy`]=known ? !emptyRoom && Boolean(this.occupied[id]) : null;
             result[`${prefix}_count`]=known ? count : null;
-            result[`${prefix}_activity`]=known && count ? (this.inside[id].moving ? 'moving' : 'still') : null;
+            // Moving if anyone moves, still only if everyone is reported still (2); any other raw value stays unknown.
+            result[`${prefix}_activity`]=known && count ? (inside.moving ? 'moving' : inside.still ? 'still' : null) : null;
         }
         return result;
     }
@@ -621,6 +636,10 @@ function zoneState(context) {
 // so read them at start and every 5 minutes; the card then also shows changes made elsewhere (e.g. AI recognition).
 const regionsReadAt=new Map();
 export async function fp400Poll(device) {
+    // Room presence is only reported when it changes, so read it once for the zones to start from.
+    if (softwareZoneContexts.get(device.ieeeAddr)?.tracker.presence===undefined) {
+        try {await device.getEndpoint(1).read('msOccupancySensing', ['occupancy']);} catch {/* the next poll tries again */}
+    }
     if (Object.keys(device.meta.fp400SoftwareZones ?? {}).length) await subscribeTracking(device);
     if (Date.now()-(regionsReadAt.get(device.ieeeAddr) ?? 0) < 300000) return;
     await withDeviceLock(device, async () => {
@@ -659,6 +678,17 @@ const softwareZoneHeartbeat={
         return {...zoneState(softwareContext(msg.device,publish)), map_rotation:msg.device.meta.fp400MapRotation ?? 0};
     },
 };
+// Endpoint 1 occupancy is the sensor's own room presence; the zones use it when positions pause.
+const fp400RoomPresence={
+    cluster:'msOccupancySensing',type:['attributeReport','readResponse'],
+    convert:(model,msg,publish)=>{
+        if(msg.endpoint.ID!==1 || msg.data.occupancy===undefined)return;
+        const context=softwareContext(msg.device,publish);
+        const events=context.tracker.setPresence((msg.data.occupancy & 1)===1,Date.now());
+        if(events.length)setImmediate(()=>{for(const ev of events)publish?.({action:`software_zone_${ev.zone}_${ev.type}`});});
+        return zoneState(context);
+    },
+};
 // Only the card uses this: it turns its map so a room seen from a corner looks square. Zones keep their own rotation.
 const fp400MapRotation={
     key:['map_rotation'],
@@ -678,7 +708,7 @@ const softwareZoneExposes=Array.from({length:8},(_,i)=>{
         e.binary(`${key}_occupancy`,ea.STATE,true,false).withDescription('Presence inside this software zone; unknown when positions are stale or incomplete'),
         e.binary(`${key}_available`,ea.STATE,true,false).withCategory('diagnostic').withDescription('Zone is configured and complete position data is fresh'),
         e.numeric(`${key}_count`,ea.STATE).withDescription('People in this software zone right now; unknown when positions are stale'),
-        e.enum(`${key}_activity`,ea.STATE,['moving','still']).withDescription('Moving if anyone in this software zone is moving, still if everyone is still; unknown when the zone is empty')];
+        e.enum(`${key}_activity`,ea.STATE,['moving','still']).withDescription('Moving if anyone in this software zone is moving, still if everyone is still; unknown when the zone is empty or the sensor sends an unknown value')];
 }).flat();
 
 const fp400Tracking = {
@@ -742,7 +772,8 @@ const fp400TrackingExposes = [
     e.text('remove_target', ea.SET).withCategory('config')
         .withDescription('Make the sensor forget one tracked target by its id from targets_xy, for example a ghost. Real people are detected again.'),
     e.text('motion_last_frame', ea.STATE).withCategory('diagnostic').withDescription('Latest raw FC0B movement event, hex'),
-    e.enum('tracking_status', ea.STATE, ['valid','invalid','stale']).withCategory('diagnostic').withDescription('Validity of position reports; invalid frames do not clear targets'),
+    e.enum('tracking_status', ea.STATE, ['valid','partial','held','invalid','stale']).withCategory('diagnostic')
+        .withDescription('valid: fresh positions. partial: the coordinator cut the last report, missing targets kept where last seen. held: no new positions; zones follow the sensor\'s own presence. invalid: unreadable report. stale: no positions and no presence'),
     e.text('tracking_last_frame', ea.STATE).withCategory('diagnostic').withDescription('Latest FC0C position event, hex (first 120 bytes)'),
     e.text('tracking_last_update', ea.STATE).withCategory('diagnostic').withDescription('Time of last complete position report'),
     e.numeric('target_count', ea.STATE).withDescription('Number of tracking records; may include retained tracks or animals'),
@@ -755,7 +786,7 @@ export default {
     vendor: 'Aqara',
     description: 'Spatial multi-sensor (presence, illuminance and people count)',
     // Numeric-name copies catch reports that arrive before the custom clusters are registered.
-    fromZigbee: [softwareZoneHeartbeat, {...softwareZoneHeartbeat,cluster:"64523"}, fp400Tracking, fp400Motion,
+    fromZigbee: [softwareZoneHeartbeat, {...softwareZoneHeartbeat,cluster:"64523"}, fp400RoomPresence, fp400Tracking, fp400Motion,
         fp400ZoneSettingsReport, fp400ZoneAbsenceReport,
         fp400CapacityReport, {...fp400CapacityReport, cluster: '64524'},
         fp400InstallationReport, {...fp400InstallationReport, cluster: '64522'},

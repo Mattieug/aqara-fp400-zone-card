@@ -75,7 +75,7 @@ type: custom:fp400-zone-card
 device: living_room_fp400 # optional
 ```
 
-`device` is the start of your FP400's entity IDs, the part before `_software_zone_1_config`. You only need it when you have more than one FP400. Without it, the card keeps working if you rename the sensor; with an old name, it tells you which name to use.
+`device` is the start of your FP400's entity IDs, the part before `_software_zone_1_config`, or its IEEE address. You only need it when you have more than one FP400. The card finds its entities by Zigbee2MQTT's fixed IDs, so renaming the sensor or its entities in Home Assistant doesn't break it; with an old `device:` name, it tells you which name to use.
 
 ## Using it
 
@@ -96,10 +96,10 @@ When you save a zone, Home Assistant gets a sensor named after it: a zone called
 
 | Entity | Name in Home Assistant | Meaning |
 |---|---|---|
-| `binary_sensor.<fp400>_software_zone_N_occupancy` | Desk occupancy | Someone is in the zone. Unknown while position data is missing or stale. |
+| `binary_sensor.<fp400>_software_zone_N_occupancy` | Desk occupancy | Someone is in the zone. When positions pause, it follows the sensor's own presence (see below). |
 | `sensor.<fp400>_software_zone_N_count` | Desk people | How many people are in the zone. |
 | `sensor.<fp400>_software_zone_N_activity` | Desk activity | `moving` or `still`; unknown when the zone is empty. |
-| `binary_sensor.<fp400>_software_zone_N_available` | Desk tracking available | The zone has fresh, complete position data. |
+| `binary_sensor.<fp400>_software_zone_N_available` | Desk tracking available | The zone has a known state right now. |
 | `text.<fp400>_software_zone_N_config` | Desk zone configuration | The zone rectangle as JSON (what the card edits). |
 
 N is the zone's number, shown next to **Zone details** in the card. The entity ID never changes, so automations keep working when you rename or move a zone. The naming needs a Home Assistant admin; for other users the sensors keep their default names, like `<fp400> Software zone 1 occupancy`. Deleting a zone gives the sensors their default names back.
@@ -129,7 +129,7 @@ The FP400's action entity (`event.<fp400>_action`, plus a device trigger in the 
 ## If something looks wrong
 
 - **The zone list is empty or says it is waiting.** Your zones are stored in Zigbee2MQTT, not in the card. The card says why it can't show them: Zigbee2MQTT or the sensor is offline, the zones haven't arrived yet after a restart, or it can't find the sensor (for example after renaming it). They come back by themselves once the cause is gone.
-- **Zones flip to "unknown".** The card's badge says **Positions unavailable** when the sensor stops sending positions. On an Ember coordinator, use converter 0.2.1 or newer (see above). If it lasts, set **Mounted on** and **Wall position** in ⚙ Settings.
+- **Zones flip to "unknown".** Use converter 0.4.0 or newer. The sensor sends positions while people move; when they pause, zones follow the sensor's own presence: nobody in the room empties every zone, and while someone is there, zones keep their last state. The card's badge then says **Positions paused**. Zones are only "unknown" when the sensor has sent neither, for example right after a restart or while it is offline. If the badge says **Positions unavailable** for long, set **Mounted on** and **Wall position** in ⚙ Settings.
 - **A dot nobody is standing on.** Click it and choose **Forget this target**; if it keeps coming back, **Ignore this spot**.
 
 ## Changelog
