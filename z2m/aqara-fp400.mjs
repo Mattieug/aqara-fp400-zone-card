@@ -115,7 +115,8 @@ const fp400AbsenceControl = {
     key: ['absence_timeout'],
     convertGet: async (entity, key, meta) => {await meta.device.getEndpoint(1).read('msOccupancySensing', [3]);},
     convertSet: async (entity, key, value, meta) => {
-        if (!Number.isInteger(value) || value < 10 || value > 300) throw new Error('Absence timeout must be 10..300 seconds');
+        // The sensor reports 10 s as its minimum (attribute 4) but stores 0, which the Aqara app also allows.
+        if (!Number.isInteger(value) || value < 0 || value > 300) throw new Error('Absence timeout must be 0..300 seconds');
         const endpoint = meta.device.getEndpoint(1);
         await endpoint.write('msOccupancySensing', {3: {value, type: 0x21}});
         const data = await endpoint.read('msOccupancySensing', [3]);
@@ -811,7 +812,7 @@ export default {
             .withDescription('Forward monitoring depth across the full width, for front-facing mounting. Approximate 0.5 m grid; check the physical cutoff. 10 m clears this depth restriction.'),
         e.enum('presence_sensitivity', ea.ALL, sensitivityValues).withCategory('config')
             .withDescription('Manual presence sensitivity. AI adaptive sensitivity is a separate setting.'),
-        e.numeric('absence_timeout', ea.ALL).withUnit('s').withValueMin(10).withValueMax(300).withValueStep(1).withCategory('config')
+        e.numeric('absence_timeout', ea.ALL).withUnit('s').withValueMin(0).withValueMax(300).withValueStep(1).withCategory('config')
             .withDescription('Delay after the last detection before reporting no presence'),
         e.enum('spatial_learning', ea.SET, ['start']).withCategory('config')
             .withDescription('Start AI space learning only with the room empty and the sensor in its final position. Result code and event receipt time are reported; the result meaning is provisional.'),

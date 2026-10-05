@@ -66,3 +66,13 @@ test('when the room empties, the zones empty too and fire leave events, even wit
     assert.equal(presence.convert({}, {endpoint: {ID: 3}, data: {occupancy: 0}, device}, () => {}), undefined, 'only endpoint 1 is the room');
     await definition.onEvent({type: 'stop', data: {ieeeAddr: device.ieeeAddr}});
 });
+test('the sensor\'s own absence timeout goes down to 0 seconds and is confirmed by reading it back', async () => {
+    const control = definition.toZigbee.find(c => c.key.includes('absence_timeout'));
+    let stored = 10;
+    const endpoint = {write: async (cluster, payload) => {stored = payload[3].value;}, read: async () => ({3: stored})};
+    const meta = {device: {getEndpoint: () => endpoint}};
+    assert.deepEqual(await control.convertSet(null, 'absence_timeout', 0, meta), {state: {absence_timeout: 0}});
+    for (const bad of [-1, 301, 2.5]) await assert.rejects(() => control.convertSet(null, 'absence_timeout', bad, meta), /0..300/);
+    endpoint.write = async () => {}; // a sensor that ignores the write
+    await assert.rejects(() => control.convertSet(null, 'absence_timeout', 30, meta), /not confirmed/);
+});

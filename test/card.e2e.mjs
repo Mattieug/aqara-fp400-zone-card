@@ -425,9 +425,9 @@ const scenarios = {
         await waitMessage(page, /Saved: Height/);
         c = await calls(page);
         check('X3 switches and numbers use the right services (height in mm)', JSON.stringify(c.slice(1).map(x => [x.service, x.entity_id, x.value ?? null])) === JSON.stringify([['turn_on', 'switch.ai_high_precision', null], ['set_value', 'number.absence_timeout', 30], ['set_value', 'number.installation_height', 2450]]), c);
-        await setting(page, 'absence_timeout').fill('5'); await setting(page, 'absence_timeout').press('Enter');
+        await setting(page, 'absence_timeout').fill('301'); await setting(page, 'absence_timeout').press('Enter');
         const s = await st(page);
-        check('X4 an out-of-range number is refused without calling the sensor', /from 10 to 300/.test(s.message) && (await calls(page)).length === 4, s.message);
+        check('X4 an out-of-range number is refused without calling the sensor', /from 0 to 300/.test(s.message) && (await calls(page)).length === 4, s.message);
         const options = await setting(page, 'installation_mode').evaluate(el => [...el.options].map(o => o.value));
         check('X5 the read-only "unknown" mounting value is not offered', JSON.stringify(options) === '["wall","ceiling"]', options);
         await btn(page, 'learn').click();

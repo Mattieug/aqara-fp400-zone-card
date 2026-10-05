@@ -7,6 +7,12 @@ To update, get the new card through HACS and copy the new `z2m/aqara-fp400.mjs` 
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-10-05
+
+### Fixed
+
+- The sensor's own **Empty after** time (`absence_timeout`) can now be set to 0 seconds ([#3](https://github.com/bobtekkk/aqara-fp400-zone-card/issues/3)). The sensor reports 10 s as its minimum but stores 0, and the Aqara app allows it too. Thanks to [@satmandu](https://github.com/satmandu) for the report.
+
 ## [0.4.0] - 2026-10-04
 
 ### Fixed
@@ -76,7 +82,8 @@ To update, get the new card through HACS and copy the new `z2m/aqara-fp400.mjs` 
 - Interference blocks, written to the sensor's own interference area.
 - Zigbee2MQTT converter (`z2m/aqara-fp400.mjs`): software zones, interference blocks, position tracking and the sensor's settings.
 
-[Unreleased]: https://github.com/bobtekkk/aqara-fp400-zone-card/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/bobtekkk/aqara-fp400-zone-card/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/bobtekkk/aqara-fp400-zone-card/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/bobtekkk/aqara-fp400-zone-card/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/bobtekkk/aqara-fp400-zone-card/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/bobtekkk/aqara-fp400-zone-card/compare/v0.2.0...v0.2.1
