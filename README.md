@@ -1,6 +1,6 @@
 # Aqara FP400 Zone Card
 
-[![HACS Custom](https://img.shields.io/badge/HACS-Custom-41BDF5.svg)](https://hacs.xyz/docs/faq/custom_repositories/)
+[![HACS Default](https://img.shields.io/badge/HACS-Default-41BDF5.svg)](https://hacs.xyz)
 [![Validate](https://github.com/bobtekkk/aqara-fp400-zone-card/actions/workflows/validate.yml/badge.svg)](https://github.com/bobtekkk/aqara-fp400-zone-card/actions/workflows/validate.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Buy me a coffee](https://img.shields.io/badge/Buy%20me%20a%20coffee-FFDD00?logo=buymeacoffee&logoColor=black)](https://buymeacoffee.com/bobtekkk)
@@ -51,9 +51,12 @@ Use only one FP400 converter at a time. If Zigbee2MQTT later supports the FP400 
 
 ### 2. Card (HACS)
 
-1. In HACS, open the ⋮ menu → **Custom repositories**, add `https://github.com/bobtekkk/aqara-fp400-zone-card` with type **Dashboard**.
-2. Search for **Aqara FP400 Zone Card** in HACS and download it.
-3. Reload your browser.
+1. In HACS, search for **Aqara FP400 Zone Card** and download it, or open it directly:
+
+   [![Open in HACS](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=bobtekkk&repository=aqara-fp400-zone-card&category=plugin)
+2. Reload your browser.
+
+If HACS doesn't find it, add it as a custom repository first: ⋮ menu → **Custom repositories**, `https://github.com/bobtekkk/aqara-fp400-zone-card`, type **Dashboard**.
 
 <details>
 <summary>Without HACS</summary>
