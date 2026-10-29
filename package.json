@@ -11,7 +11,7 @@
   },
   "devDependencies": {
     "playwright-core": "1.49.0",
-    "zigbee-herdsman": "10.9.2",
-    "zigbee-herdsman-converters": "26.105.0"
+    "zigbee-herdsman": "10.10.0",
+    "zigbee-herdsman-converters": "26.115.1"
   }
 }

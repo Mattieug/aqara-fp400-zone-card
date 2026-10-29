@@ -1,0 +1,35 @@
+name: Something doesn't work
+description: The card, a zone or the sensor doesn't do what you expect
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what you saw instead. Screenshots of the card help a lot.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Card and converter version
+      description: The card's version in HACS, and the converter's if you copied it at a different time.
+      placeholder: 0.4.1
+    validations:
+      required: true
+  - type: input
+    id: firmware
+    attributes:
+      label: FP400 firmware
+      description: Zigbee2MQTT → your FP400 → About → Firmware build date.
+      placeholder: "20260915"
+  - type: input
+    id: z2m
+    attributes:
+      label: Zigbee2MQTT version and coordinator
+      placeholder: 2.14.2, Sonoff ZBDongle-E
+  - type: textarea
+    id: log
+    attributes:
+      label: Zigbee2MQTT log
+      description: Lines with your FP400's name or address from around the time it happened, if you have them.
+      render: text
