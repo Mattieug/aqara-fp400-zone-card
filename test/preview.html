@@ -27,6 +27,7 @@ if(!params.has('nosettings')){
     for(const key of ['ai_high_precision','ai_adaptive_sensitivity','ai_entry_exit_recognition','ai_interference_recognition','human_count_enabled'])set('switch',key,'off');
     set('button','spatial_learning','unknown');set('button','refresh_configuration','unknown');set('sensor','learning_result_time','2026-09-30T09:27:37.721Z');
     if(!old)set('number','map_rotation',params.get('rotation')??'0',{min:-180,max:180,step:1});
+    if(!old)set('number','forget_still_targets','0',{min:0,max:240,step:1});
 }
 // Simulated converter: three masks of 20 rows x 16 cols of 50 cm cells (x -400..400, y 0..1000), columns right to left.
 // Like the real converter, each edit reads the mask, waits for the radio, then writes it back,

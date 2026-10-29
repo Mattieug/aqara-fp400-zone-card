@@ -3,8 +3,10 @@
 // https://github.com/bobtekkk/aqara-fp400-zone-card (MIT License)
 import * as m from 'zigbee-herdsman-converters/lib/modernExtend';
 import * as exposes from 'zigbee-herdsman-converters/lib/exposes';
+import {logger} from 'zigbee-herdsman-converters/lib/logger';
 const e = exposes.presets;
 const ea = exposes.access;
+const NS = 'zhc:fp400';
 // Vendor attributes confirmed by direct reads from this FP400.
 const aqaraHumanCount = {
     cluster: 'aqaraFp400Radar',
@@ -67,6 +69,7 @@ const fp400ConfigControl = {
         await endpoint.write(configCluster, {[option.id]: {value: option.values[value], type: option.type}}, manufacturerOptions);
         const readback = decodeConfig(await endpoint.read(configCluster, [configOptions[key].id], manufacturerOptions));
         if (readback[key] !== value) throw new Error(`${key} was not confirmed by the sensor`);
+        await remember(meta.device, keptSetting(key), option.values[value]);
         return {state: readback};
     },
 };
@@ -108,6 +111,7 @@ const fp400SensitivityControl = {
         await endpoint.write(128, {0: {value: level, type: 0x20}});
         const data = await endpoint.read(128, [0]);
         if (data[0] !== level) throw new Error('Sensitivity write was not confirmed');
+        await remember(meta.device, keptSetting('presence_sensitivity'), level);
         return {state: {presence_sensitivity: value}};
     },
 };
@@ -121,6 +125,7 @@ const fp400AbsenceControl = {
         await endpoint.write('msOccupancySensing', {3: {value, type: 0x21}});
         const data = await endpoint.read('msOccupancySensing', [3]);
         if (data[3] !== value) throw new Error('Absence timeout write was not confirmed');
+        await remember(meta.device, keptSetting('absence_timeout'), value);
         return {state: {absence_timeout: value}};
     },
 };
@@ -166,6 +171,7 @@ const fp400DepthControl = {
             await endpoint.write(configCluster, {20: {value: mask, type: 0x41}}, manufacturerOptions);
             const data = await endpoint.read(configCluster, [20], manufacturerOptions);
             if (!boundaryBuffer(data[20]).equals(mask)) throw new Error('Monitoring depth write was not confirmed');
+            await remember(meta.device, keptSetting('monitoring_region'), mask);
         });
         return {state: {detection_depth: value}};
     },
@@ -229,6 +235,74 @@ function withDeviceLock(device, task) {
     deviceLocks.set(device.ieeeAddr, run.catch(() => {}));
     return run;
 }
+// The FP400 forgets its areas and mounting when it loses power (a Zigbee2MQTT restart keeps them), so every
+// setting written through this converter is kept with the device and put back when the sensor has lost it.
+// Settings made before this existed are taken over from the sensor at the first check.
+const restorable = [
+    ...Object.entries(configOptions).map(([name, option]) => ({name, endpoint: 1, cluster: configCluster, attribute: option.id, type: option.type, manufacturer: true})),
+    {name: 'installation_height', endpoint: 1, cluster: configCluster, attribute: 4, type: 0x21, manufacturer: true},
+    {name: 'presence_sensitivity', endpoint: 1, cluster: 128, attribute: 0, type: 0x20},
+    {name: 'absence_timeout', endpoint: 1, cluster: 'msOccupancySensing', attribute: 3, type: 0x21},
+    ...Object.entries(regionAttributes).map(([name, attribute]) => ({name, endpoint: 1, cluster: configCluster, attribute, type: 0x41, manufacturer: true})),
+];
+const keptSetting = name => restorable.find(setting => setting.name === name);
+const savedKey = setting => `${setting.endpoint}/${setting.cluster}/${setting.attribute}`;
+const isMask = setting => setting.type === 0x41;
+const emptyMask = hex => !/[^0]/.test(hex);
+// Masks are kept as hex, everything else as the raw number (booleans included).
+function savedValue(setting, raw) {return isMask(setting) ? regionBuffer(raw).toString('hex') : Number(raw);}
+// What a wiped sensor reports: no areas, no mounting. Nothing worth taking over.
+function unsetValue(setting, value) {
+    return isMask(setting) ? emptyMask(value) : ['installation_mode', 'side_installation', 'installation_height'].includes(setting.name) && value === 0;
+}
+async function remember(device, setting, raw) {
+    device.meta ??= {};
+    device.meta.fp400Saved = {...device.meta.fp400Saved, [savedKey(setting)]: {...setting, value: savedValue(setting, raw)}};
+    try {await device.save?.();} catch { /* kept in memory; saved with the next change */ }
+}
+async function readSetting(device, setting) {
+    const data = await device.getEndpoint(setting.endpoint).read(setting.cluster, [setting.attribute], setting.manufacturer ? manufacturerOptions : {});
+    const raw = data?.[setting.attribute] ?? data?.[setting.name];
+    if (raw === undefined) throw new Error(`${setting.name} was not returned`);
+    return savedValue(setting, raw);
+}
+// Puts back what the sensor lost and returns its names. An area is only put back when the sensor's is empty,
+// because the sensor's own recognition may have changed it since. Throws when the sensor does not answer.
+export async function restoreSettings(device) {
+    // Every FP400 has areas, so this read tells an offline sensor from a setting its firmware lacks.
+    await device.getEndpoint(1).read(configCluster, [regionAttributes.interference_region], manufacturerOptions);
+    const saved = {...device.meta?.fp400Saved}, restored = [], failed = [];
+    let adopted = false;
+    for (const setting of restorable) {
+        if (saved[savedKey(setting)]) continue;
+        try {
+            const value = await readSetting(device, setting);
+            if (!unsetValue(setting, value)) {saved[savedKey(setting)] = {...setting, value};adopted = true;}
+        } catch { /* not on this firmware */ }
+    }
+    if (adopted) {
+        device.meta ??= {};
+        device.meta.fp400Saved = saved;
+        try {await device.save?.();} catch { /* taken over again at the next check */ }
+    }
+    // Mounting first and areas last, in case a new mounting makes the sensor redo its areas.
+    const order = setting => {const index = restorable.findIndex(known => savedKey(known) === savedKey(setting));return index < 0 ? restorable.length : index;};
+    for (const setting of Object.values(saved).sort((a, b) => order(a) - order(b))) {
+        try {
+            const current = await readSetting(device, setting);
+            if (current === setting.value || (isMask(setting) && (!emptyMask(current) || emptyMask(setting.value)))) continue;
+            const value = isMask(setting) ? Buffer.from(setting.value, 'hex') : setting.value;
+            await device.getEndpoint(setting.endpoint).write(setting.cluster, {[setting.attribute]: {value, type: setting.type}}, setting.manufacturer ? manufacturerOptions : {});
+            if (await readSetting(device, setting) !== setting.value) throw new Error('not confirmed');
+            restored.push(setting.name);
+        } catch {failed.push(setting.name);}
+    }
+    if (failed.length) logger.warning(`FP400 '${device.ieeeAddr}': could not check or put back ${failed.join(', ')}`, NS);
+    return restored;
+}
+// Checked after a Zigbee2MQTT start, after the sensor announces itself (it does when power returns),
+// and when the periodic area read finds a kept area wiped.
+const restoreChecked = new Set();
 // Monitoring cells are stored as exclusions, so a clear bit means "selected".
 function regionState(key, value) {
     let set = 0;
@@ -277,6 +351,7 @@ const fp400InstallationControl = {
         await endpoint.write(configCluster, {4: {value, type: 0x21}}, manufacturerOptions);
         const data = await endpoint.read(configCluster, [4, 5, 6, 7, 8], manufacturerOptions);
         if (data[4] !== value) throw new Error('Mounting height was not confirmed by the sensor');
+        await remember(meta.device, keptSetting('installation_height'), value);
         return {state: decodeInstallation(data)};
     },
 };
@@ -289,6 +364,7 @@ async function writeRegion(device, id, change) {
         await endpoint.write(configCluster, {[id]: {value: mask, type: 0x41}}, manufacturerOptions);
         const readback = await endpoint.read(configCluster, [id], manufacturerOptions);
         if (!regionBuffer(readback[id]).equals(mask)) throw new Error('Region write was not confirmed by the sensor');
+        await remember(device, restorable.find(setting => isMask(setting) && setting.attribute === id), mask);
         const state = decodeInstallation(readback);
         if (id === regionAttributes.monitoring_region) state.detection_depth = decodeDepth(readback[id]);
         return {state};
@@ -458,13 +534,15 @@ const fp400ZoneSettingsControl = {
             if (!Number.isInteger(minimum) || !Number.isInteger(maximum) || minimum > maximum) {
                 throw new Error('Sensor did not return usable zone timeout bounds');
             }
-            if (value < minimum || value > maximum) throw new Error(`Zone timeout must be ${minimum}..${maximum} seconds`);
+            // Like the room's, the reported minimum (10 s) is not enforced: the sensor stores 0.
+            if (value > maximum) throw new Error(`Zone timeout must be 0..${maximum} seconds`);
         }
         const cluster = sensitivity ? 128 : 'msOccupancySensing';
         const attribute = sensitivity ? 0 : 3;
         await endpoint.write(cluster, {[attribute]: {value: encoded, type: sensitivity ? 0x20 : 0x21}});
         const data = await endpoint.read(cluster, [attribute]);
         if (data[attribute] !== encoded) throw new Error('Zone setting was not confirmed by the sensor');
+        await remember(meta.device, {name: key, endpoint: zone + 2, cluster, attribute, type: sensitivity ? 0x20 : 0x21}, encoded);
         return {state: {[key]: value}};
     },
 };
@@ -551,8 +629,11 @@ export function inZone(t, z) {
     }
     return x >= z.x_min && x < z.x_max && y >= z.y_min && y < z.y_max;
 }
+// A target whose position stays within this many centimetres has not moved. Real dots either sit on exactly
+// the same spot or jump by more: on a real FP400, 5, 10 and 15 cm found the same still spans.
+const STILL_RADIUS=10;
 export class SoftwareZoneTracker {
-    constructor(zones = {}) {this.zones=zones;this.lastAt=null;this.outsideSince={};this.occupied={};this.inside={};this.lastSeen=new Map();this.awaiting=new Set();this.invalid=false;this.partial=false;this.presence=undefined;}
+    constructor(zones = {}) {this.zones=zones;this.lastAt=null;this.outsideSince={};this.occupied={};this.inside={};this.lastSeen=new Map();this.still=new Map();this.awaiting=new Set();this.invalid=false;this.partial=false;this.presence=undefined;}
     // Returns the targets that entered or left each zone with this frame. When the report was cut short
     // (reported > targets.length), targets missing from it are assumed to stay where they were last seen;
     // if even that cannot account for every target, no zone starts counting down to empty.
@@ -564,6 +645,12 @@ export class SoftwareZoneTracker {
         const unaccounted=missing>carried.length;
         if (missing<=0) this.lastSeen.clear(); // a complete report is the whole truth
         for (const t of targets) this.lastSeen.set(t.id,{...t,at:now});
+        // Where and since when each target has stayed put; a cut report says nothing about the targets it lost.
+        for (const t of targets) {
+            const spot=this.still.get(t.id);
+            if (Number.isInteger(t.id) && (!spot || Math.hypot(t.x-spot.x,t.y-spot.y)>STILL_RADIUS)) this.still.set(t.id,{x:t.x,y:t.y,since:now});
+        }
+        if (missing<=0) for (const id of this.still.keys()) if (!decoded.has(id)) this.still.delete(id);
         const all=[...targets,...carried],events=[];
         for (const [id,z] of Object.entries(this.zones)) {
             const inside=all.filter(t=>inZone(t,z));
@@ -590,7 +677,26 @@ export class SoftwareZoneTracker {
         const events=[];
         for (const [id,inside] of Object.entries(this.inside)) for (const t of inside.ids) events.push({zone:Number(id),type:'leave'});
         for (const id of Object.keys(this.zones)) {this.occupied[id]=false;this.inside[id]={ids:new Set(),moving:false,still:false};delete this.outsideSince[id];}
-        this.lastSeen.clear();
+        this.lastSeen.clear();this.still.clear();
+        return events;
+    }
+    // Targets that have not moved for ms. Usually ghosts, but people asleep can lie this still for over an hour.
+    stillFor(ms, now) {return [...this.still].filter(([,spot])=>now-spot.since>=ms).map(([id])=>id);}
+    // Count a still target's time from now again, e.g. when the sensor could not be told to forget it.
+    restartStill(id, now) {const spot=this.still.get(id);if (spot) spot.since=now;}
+    // The sensor was told to forget a target. With fresh positions the next report shows whether it went; while
+    // positions are paused nothing else would let its zones empty, so it leaves them now (a real person comes back).
+    forget(id, now) {
+        this.still.delete(id);this.lastSeen.delete(id);
+        if (this.lastAt!==null && now-this.lastAt<30000) return [];
+        const events=[];
+        for (const [zone,inside] of Object.entries(this.inside)) {
+            if (!inside.ids.has(id)) continue;
+            const ids=new Set([...inside.ids].filter(other=>other!==id)), left=[...ids].map(other=>this.lastSeen.get(other)).filter(Boolean);
+            this.inside[zone]={ids,moving:left.some(t=>t.activity===1),still:left.length>0 && left.every(t=>t.activity===2)};
+            if (!ids.size && this.outsideSince[zone]===undefined) this.outsideSince[zone]=now;
+            events.push({zone:Number(zone),type:'leave'});
+        }
         return events;
     }
     state(now) {
@@ -633,20 +739,53 @@ function softwareContext(device, publish) {
 function zoneState(context) {
     const state=context.tracker.state(Date.now());context.lastState=JSON.stringify(state);return state;
 }
-// Every 10 s: keep the position stream alive while zones exist. The sensor never reports its area masks on its own,
-// so read them at start and every 5 minutes; the card then also shows changes made elsewhere (e.g. AI recognition).
+// Every 10 s: put back settings the sensor lost (when due) and keep the position stream alive while zones exist.
+// The sensor never reports its area masks on its own, so read them at start and every 5 minutes; the card then
+// also shows changes made elsewhere (e.g. AI recognition).
 const regionsReadAt=new Map();
 export async function fp400Poll(device) {
     // Room presence is only reported when it changes, so read it once for the zones to start from.
     if (softwareZoneContexts.get(device.ieeeAddr)?.tracker.presence===undefined) {
         try {await device.getEndpoint(1).read('msOccupancySensing', ['occupancy']);} catch {/* the next poll tries again */}
     }
-    if (Object.keys(device.meta.fp400SoftwareZones ?? {}).length) await subscribeTracking(device);
+    if (!restoreChecked.has(device.ieeeAddr)) {
+        try {
+            const restored = await withDeviceLock(device, () => restoreSettings(device));
+            restoreChecked.add(device.ieeeAddr);
+            if (restored.length) logger.info(`FP400 '${device.ieeeAddr}' lost settings (usually a power cut); put back: ${restored.join(', ')}`, NS);
+        } catch {/* the sensor did not answer; the next poll tries again */}
+    }
+    await forgetStillTargets(device);
+    if (Object.keys(device.meta.fp400SoftwareZones ?? {}).length || device.meta.fp400ForgetStill) await subscribeTracking(device);
     if (Date.now()-(regionsReadAt.get(device.ieeeAddr) ?? 0) < 300000) return;
     await withDeviceLock(device, async () => {
-        for (const id of Object.values(regionAttributes)) await device.getEndpoint(1).read(configCluster, [id], manufacturerOptions);
+        for (const id of Object.values(regionAttributes)) {
+            const data = await device.getEndpoint(1).read(configCluster, [id], manufacturerOptions);
+            // A kept area that reads empty: the sensor lost power without its announcement reaching us.
+            const kept = device.meta.fp400Saved?.[`1/${configCluster}/${id}`]?.value;
+            if (kept && !emptyMask(kept) && data?.[id] !== undefined && emptyMask(regionBuffer(data[id]).toString('hex'))) restoreChecked.delete(device.ieeeAddr);
+        }
     });
     regionsReadAt.set(device.ieeeAddr, Date.now());
+}
+// Opt-in: tell the sensor to forget targets that have not moved for the minutes chosen in forget_still_targets.
+async function forgetStillTargets(device) {
+    const minutes=device.meta.fp400ForgetStill, context=softwareZoneContexts.get(device.ieeeAddr);
+    if (!minutes || !context) return;
+    for (const id of context.tracker.stillFor(minutes*60000, Date.now())) {
+        try {await removeTarget(device, id);}
+        catch (error) {
+            logger.warning(`FP400 '${device.ieeeAddr}' could not forget target ${id}, which has not moved for ${minutes} min: ${error.message}`, NS);
+            context.tracker.restartStill(id, Date.now());
+            continue;
+        }
+        logger.info(`FP400 '${device.ieeeAddr}' forgot target ${id}: it had not moved for ${minutes} min`, NS);
+        const events=context.tracker.forget(id, Date.now());
+        if (events.length) {
+            context.publish?.(zoneState(context));
+            for (const ev of events) context.publish?.({action:`software_zone_${ev.zone}_${ev.type}`});
+        }
+    }
 }
 async function subscribeTracking(device, seconds=120) {
     const result=await device.getEndpoint(1).command('aqaraFp400Location','subscribeLocationData',{timeout:seconds},
@@ -676,7 +815,8 @@ const softwareZoneHeartbeat={
     cluster:'aqaraFp400Radar',type:['attributeReport','readResponse'],
     convert:(model,msg,publish)=>{
         if(msg.endpoint.ID!==1)return;
-        return {...zoneState(softwareContext(msg.device,publish)), map_rotation:msg.device.meta.fp400MapRotation ?? 0};
+        return {...zoneState(softwareContext(msg.device,publish)), map_rotation:msg.device.meta.fp400MapRotation ?? 0,
+            forget_still_targets:msg.device.meta.fp400ForgetStill ?? 0};
     },
 };
 // Endpoint 1 occupancy is the sensor's own room presence; the zones use it when positions pause.
@@ -701,6 +841,19 @@ const fp400MapRotation={
         meta.device.meta.fp400MapRotation=rotation;
         try {await meta.device.save();} catch(error) {meta.device.meta.fp400MapRotation=previous;throw error;}
         return {state:{map_rotation:rotation}};
+    },
+};
+// Kept in Zigbee2MQTT, not on the sensor: minutes after which a target that has not moved is forgotten (0: off).
+const fp400ForgetStill={
+    key:['forget_still_targets'],
+    convertGet:async(entity,key,meta)=>{meta.publish({forget_still_targets:meta.device.meta.fp400ForgetStill ?? 0});},
+    convertSet:async(entity,key,value,meta)=>{
+        const minutes=Number(value);
+        if(String(value).trim()==='' || !Number.isInteger(minutes) || minutes<0 || minutes>240) throw new Error('forget_still_targets must be 0..240 minutes (0 turns it off)');
+        const previous=meta.device.meta.fp400ForgetStill;
+        meta.device.meta.fp400ForgetStill=minutes;
+        try {await meta.device.save();} catch(error) {meta.device.meta.fp400ForgetStill=previous;throw error;}
+        return {state:{forget_still_targets:minutes}};
     },
 };
 const softwareZoneExposes=Array.from({length:8},(_,i)=>{
@@ -752,6 +905,11 @@ const fp400Motion = {
     },
 };
 // FC0C command 1: the sensor drops one track, e.g. a ghost. A real person is simply picked up again.
+async function removeTarget(device, targetId) {
+    const result = await device.getEndpoint(1).command('aqaraFp400Location', 'removeDetectionTarget', {targetId},
+        {...manufacturerOptions, disableDefaultResponse: false, disableResponse: false});
+    if (result?.statusCode !== 0) throw new Error(`The sensor did not accept removing target ${targetId}: ${JSON.stringify(result)}`);
+}
 const fp400RemoveTarget = {
     key: ['remove_target'],
     convertSet: async (entity, key, value, meta) => {
@@ -759,9 +917,7 @@ const fp400RemoveTarget = {
         if (String(value).trim() === '' || !Number.isInteger(targetId) || targetId < 0 || targetId > 255) {
             throw new Error('remove_target needs a target id from targets_xy (0..255)');
         }
-        const result = await meta.device.getEndpoint(1).command('aqaraFp400Location', 'removeDetectionTarget', {targetId},
-            {...manufacturerOptions, disableDefaultResponse: false, disableResponse: false});
-        if (result?.statusCode !== 0) throw new Error(`The sensor did not accept removing target ${targetId}: ${JSON.stringify(result)}`);
+        await removeTarget(meta.device, targetId);
         return {state: {}};
     },
 };
@@ -772,6 +928,8 @@ const fp400TrackingExposes = [
         .withDescription('How far the zone card turns its map, so a room seen from a corner looks square. Zones keep their own rotation.'),
     e.text('remove_target', ea.SET).withCategory('config')
         .withDescription('Make the sensor forget one tracked target by its id from targets_xy, for example a ghost. Real people are detected again.'),
+    e.numeric('forget_still_targets', ea.ALL).withUnit('min').withValueMin(0).withValueMax(240).withValueStep(1).withCategory('config')
+        .withDescription('Make the sensor forget a target whose position has not changed for this many minutes, usually a ghost that keeps a zone occupied. A real person is picked up again. People asleep can lie this still for over an hour. 0 turns it off.'),
     e.text('motion_last_frame', ea.STATE).withCategory('diagnostic').withDescription('Latest raw FC0B movement event, hex'),
     e.enum('tracking_status', ea.STATE, ['valid','partial','held','invalid','stale']).withCategory('diagnostic')
         .withDescription('valid: fresh positions. partial: the coordinator cut the last report, missing targets kept where last seen. held: no new positions; zones follow the sensor\'s own presence. invalid: unreadable report. stale: no positions and no presence'),
@@ -780,6 +938,60 @@ const fp400TrackingExposes = [
     e.numeric('target_count', ea.STATE).withDescription('Number of tracking records; may include retained tracks or animals'),
     e.text('targets_xy', ea.STATE).withDescription('id:x:y positions in raw device units; units/orientation need room calibration'),
 ];
+// FC0A attribute 16 lists the sensor's native zones as [id, type, cells, enabled] structs; null when unreadable.
+export function nativeZoneIds(value) {
+    if (!Array.isArray(value)) return null;
+    const ids = value.map(record => {
+        const first = Array.isArray(record) ? record[0] : record;
+        return typeof first === 'object' && first !== null ? first.elmVal : first;
+    });
+    return ids.every(Number.isInteger) ? ids : null;
+}
+// The FP400's reporting table holds five entries. Room presence takes the first (m.occupancy on endpoint 1), then
+// the native zones the sensor actually has, then the light sensor. Whatever gets no entry is polled.
+export const fp400ReportingSlots = {
+    isModernExtend: true,
+    configure: [async (device, coordinatorEndpoint) => {
+        let zones = null;
+        try {zones = nativeZoneIds((await device.getEndpoint(1).read(configCluster, [16], manufacturerOptions))[16]);} catch {}
+        const occupancy = max => [{attribute: 'occupancy', minimumReportInterval: 0, maximumReportInterval: max, reportableChange: 0}];
+        // Converter 0.4 and older reported endpoints 3-6. A maximum interval of 0xFFFF stops a report and frees its entry.
+        const unused = zones ? zoneSlots.filter(({zone}) => !zones.includes(zone)) : [];
+        for (const {endpoint} of unused) {
+            try {await device.getEndpoint(endpoint).configureReporting('msOccupancySensing', occupancy(0xffff));} catch {}
+        }
+        const reported = [];
+        const report = async (id, cluster, items) => {
+            try {
+                const endpoint = device.getEndpoint(id);
+                await endpoint.bind(cluster, coordinatorEndpoint);
+                await endpoint.configureReporting(cluster, items);
+                reported.push(id);
+            } catch { /* table full (INSUFFICIENT_SPACE): polled instead */ }
+        };
+        for (const {endpoint} of zoneSlots.filter(slot => !unused.includes(slot))) await report(endpoint, 'msOccupancySensing', occupancy(3600));
+        await report(2, 'msIlluminanceMeasurement', [{attribute: 'measuredValue', minimumReportInterval: 10, maximumReportInterval: 3600, reportableChange: 5}]);
+        device.meta.fp400Reporting = {reported, zones};
+        device.save();
+    }],
+};
+// Zone endpoints without a report entry; before the converter shared out the entries, 3-6 had them.
+function polledZoneEndpoints(device) {
+    const reporting = device.meta?.fp400Reporting;
+    if (!reporting) return [7, 8, 9, 10];
+    return zoneSlots.filter(({zone, endpoint}) => !reporting.reported.includes(endpoint) && (!reporting.zones || reporting.zones.includes(zone)))
+        .map(({endpoint}) => endpoint);
+}
+export async function fp400UnreportedPoll(device) {
+    // The light is read even when reported, and first, so slow or missing zone endpoints can't hold it up.
+    let failure;
+    try {await device.getEndpoint(2).read('msIlluminanceMeasurement', ['measuredValue']);} catch (error) {failure = error;}
+    // An unused or temporarily unavailable zone must not block the others.
+    for (const id of polledZoneEndpoints(device)) {
+        try {await device.getEndpoint(id).read('msOccupancySensing', ['occupancy']);} catch {}
+    }
+    if (failure) throw failure;
+}
 
 export default {
     zigbeeModel: ['lumi.models.4447_8295'],
@@ -787,6 +999,8 @@ export default {
     vendor: 'Aqara',
     ota: true,
     description: 'Spatial multi-sensor (presence, illuminance and people count)',
+    // Zigbee2MQTT runs configure again once when this changes. 0.0.2: reporting entries go to the light and real zones.
+    version: '0.0.2',
     // Numeric-name copies catch reports that arrive before the custom clusters are registered.
     fromZigbee: [softwareZoneHeartbeat, {...softwareZoneHeartbeat,cluster:"64523"}, fp400RoomPresence, fp400Tracking, fp400Motion,
         fp400ZoneSettingsReport, fp400ZoneAbsenceReport,
@@ -801,7 +1015,7 @@ export default {
         aqaraActivityState,
         {...aqaraActivityState, cluster: '64524'},
     ],
-    toZigbee: [softwareZoneControl, fp400MapRotation, fp400RemoveTarget, fp400ZoneSettingsControl, fp400CapacityGet,
+    toZigbee: [softwareZoneControl, fp400MapRotation, fp400ForgetStill, fp400RemoveTarget, fp400ZoneSettingsControl, fp400CapacityGet,
         ...fp400InstallationControl.key.map(key => ({...fp400InstallationControl, key: [key]})),
         ...fp400RegionControl.key.map(key => ({...fp400RegionControl, key: [key]})),
         ...fp400RegionGet.key.map(key => ({...fp400RegionGet, key: [key]})),
@@ -827,12 +1041,15 @@ export default {
     ],
     // Tracking (re)starts from the 10 s poll below: on 'start' this hook runs before the custom clusters exist.
     onEvent: async(event)=>{
+        // The sensor announces itself when power returns, with its areas and mounting forgotten.
+        if(event.type==='deviceAnnounce') restoreChecked.delete(event.data.device.ieeeAddr);
         if(event.type==='stop') {
             const context=softwareZoneContexts.get(event.data.ieeeAddr);
             if(context)clearInterval(context.timer);
             softwareZoneContexts.delete(event.data.ieeeAddr);
             deviceLocks.delete(event.data.ieeeAddr);
             regionsReadAt.delete(event.data.ieeeAddr);
+            restoreChecked.delete(event.data.ieeeAddr);
         }
     },
     extend: [
@@ -865,24 +1082,12 @@ export default {
             multiEndpointSkip: [...zoneSettingKeys, 'maximum_detection_targets', ...Object.keys(configOptions), ...fp400AdditionalExposes.map(expose => expose.property), 'spatial_learning', 'detection_depth', 'presence_sensitivity', 'absence_timeout'],
             endpoints: Object.fromEntries(Array.from({length: 10}, (_, i) => [String(i + 1), i + 1])),
         }),
-        // The FP400 rejects configureReporting on endpoint 7 with INSUFFICIENT_SPACE.
-        // Keep reports already accepted by endpoints 1 and 3-6.
-        m.occupancy({endpointNames: ['1', '3', '4', '5', '6']}),
-        m.occupancy({endpointNames: ['7', '8', '9', '10'], reporting: false}),
+        m.occupancy({endpointNames: ['1']}),
+        m.occupancy({endpointNames: ['3', '4', '5', '6', '7', '8', '9', '10'], reporting: false}),
         m.identify(),
-        // A read succeeds on endpoint 2; poll it because reporting is not configured.
         m.illuminance({endpointNames: ['2'], reporting: false}),
-        m.poll({
-            key: 'fp400_unreported_attributes',
-            defaultIntervalSeconds: 60,
-            poll: async (device) => {
-                // An unused or temporarily unavailable zone must not block the others.
-                for (const id of [7, 8, 9, 10]) {
-                    try {await device.getEndpoint(id).read('msOccupancySensing', ['occupancy']);} catch {}
-                }
-                await device.getEndpoint(2).read('msIlluminanceMeasurement', ['measuredValue']);
-            },
-        }),
+        fp400ReportingSlots,
+        m.poll({key: 'fp400_unreported_attributes', defaultIntervalSeconds: 60, poll: fp400UnreportedPoll}),
         m.poll({
             key: 'fp400_people_attributes',
             defaultIntervalSeconds: 30,

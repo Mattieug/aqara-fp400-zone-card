@@ -435,6 +435,13 @@ const scenarios = {
         await btn(page, 'learn').click();
         await waitMessage(page, /Room learning finished/, 8000);
         check('X7 the second press starts learning and the card reports the result', (await calls(page)).at(-1).service === 'press', await calls(page));
+        await setting(page, 'forget_still_targets').fill('15'); await setting(page, 'forget_still_targets').press('Enter');
+        await waitMessage(page, /Saved: Forget still dots after/);
+        const forget = (await calls(page)).at(-1);
+        check('X7b forgetting still dots is set in minutes', forget.service === 'set_value' && forget.entity_id === 'number.forget_still_targets' && forget.value === 15, forget);
+        await setting(page, 'forget_still_targets').fill('241'); await setting(page, 'forget_still_targets').press('Enter');
+        const refused = (await st(page)).message, after = await calls(page);
+        check('X7c more than 240 minutes is refused without calling the sensor', /from 0 to 240/.test(refused) && JSON.stringify(after.at(-1)) === JSON.stringify(forget), refused);
         await page.locator('fp400-zone-card #settings [data-action="settings"]').click();
         shown = await page.evaluate(() => getComputedStyle(document.querySelector('fp400-zone-card').shadowRoot.querySelector('#zone-list').parentElement).display);
         check('X8 closing settings brings the zone list back', shown !== 'none', shown);

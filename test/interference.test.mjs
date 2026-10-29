@@ -69,15 +69,19 @@ test('clear accepts a sensor that reports an empty mask as zero-length', async (
     assert.equal(result.state.interference_mask_hex, '0'.repeat(80));
 });
 test('area masks are read at start and then every 5 minutes, not on every poll', async () => {
-    const reads = [], commands = [];
-    const device = {ieeeAddr: 'poll-test', meta: {}, getEndpoint: () => ({read: async (cluster, [id]) => {reads.push(id); return {};}, command: async (...args) => {commands.push(args[1]); return {statusCode: 0};}})};
-    await fp400Poll(device); await fp400Poll(device);
-    const regions = () => reads.filter(r => r !== 'occupancy');
-    assert.deepEqual(regions(), [18, 19, 20]); assert.deepEqual(commands, [], 'no zones, no tracking subscription');
+    let reads = [];
+    const commands = [];
+    // Answers like a sensor with nothing set, so the first poll's check for lost settings finishes.
+    const device = {ieeeAddr: 'poll-test', meta: {}, getEndpoint: () => ({read: async (cluster, [id]) => {reads.push(id); return {[id]: [18, 19, 20].includes(id) ? Buffer.alloc(40) : 0};}, command: async (...args) => {commands.push(args[1]); return {statusCode: 0};}})};
+    await fp400Poll(device);
+    assert.deepEqual(reads.slice(-3), [18, 19, 20]); assert.deepEqual(commands, [], 'no zones, no tracking subscription');
     assert.ok(reads.includes('occupancy'), 'room presence is read while unknown');
+    reads = [];
+    await fp400Poll(device);
+    assert.deepEqual(reads, ['occupancy'], 'later polls only read what is still unknown');
     device.meta.fp400SoftwareZones = {1: {name: 'Desk'}};
     await fp400Poll(device);
-    assert.deepEqual(commands, ['subscribeLocationData']); assert.equal(regions().length, 3);
+    assert.deepEqual(commands, ['subscribeLocationData']); assert.deepEqual(reads, ['occupancy', 'occupancy']);
 });
 test('card and converter pick the same cells for shapes drawn on a turned map', () => {
     for (const rotation of [30, 45, -45, 90, 137, -170]) for (const rect of [{x_min:-200,x_max:150,y_min:100,y_max:400}, {x_min:0,x_max:50,y_min:300,y_max:350}, {x_min:-600,x_max:600,y_min:-100,y_max:1200}]) {

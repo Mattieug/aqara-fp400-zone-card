@@ -16,6 +16,7 @@ const SETTINGS = [
         ['number','absence_timeout','Empty after',{unit:'s'}],
         ['select','proximity_distance','Approach distance',{far:'Far',medium:'Medium',near:'Near'}],
         ['select','detection_direction','Movement events',{omnidirectional:'Any direction',left_right:'Left and right'}],
+        ['number','forget_still_targets','Forget still dots after',{unit:'min',hint:'0 is off. A dot that has not moved at all for this long is probably a ghost, so the sensor is told to forget it. A real person comes back. People asleep can lie this still for over an hour, so use a long time in a bedroom.'}],
     ]],
     ['Smart features',[
         ['switch','ai_high_precision','Better person recognition'],

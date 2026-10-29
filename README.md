@@ -127,6 +127,7 @@ The FP400's action entity (`event.<fp400>_action`, plus a device trigger in the 
 - The converter re-reads the areas every 5 minutes, so the card also shows changes made elsewhere.
 - Ember (EZSP) coordinators, like the Sonoff ZBDongle-E and Home Assistant SkyConnect, cut the sensor's position reports at 80 bytes when it tracks 3 or more targets ([zigbee-herdsman#1886](https://github.com/Koenkk/zigbee-herdsman/issues/1886)). The converter uses everything that arrives: with 3 targets nothing is lost; with 4 or more, a missing target is assumed to stay where it was last seen. Z-Stack coordinators are not affected. Ghost targets make this happen more often, so get rid of them (see **A dot you don't trust** above).
 - Everything in the settings panel is also a normal Home Assistant entity (select, number, switch, button) on the FP400 device page.
+- The FP400 forgets its areas and mounting when it loses power. The converter keeps everything you save and puts back what the sensor lost when it comes back; the Zigbee2MQTT log says what it put back.
 - The map turn is stored with the sensor (`number.<fp400>_map_rotation`), so every dashboard shows the room the same way. Each zone remembers the turn it was drawn with.
 
 ## If something looks wrong
@@ -134,6 +135,7 @@ The FP400's action entity (`event.<fp400>_action`, plus a device trigger in the 
 - **The zone list is empty or says it is waiting.** Your zones are stored in Zigbee2MQTT, not in the card. The card says why it can't show them: Zigbee2MQTT or the sensor is offline, the zones haven't arrived yet after a restart, or it can't find the sensor (for example after renaming it). They come back by themselves once the cause is gone.
 - **Zones flip to "unknown".** Use converter 0.4.0 or newer. The sensor sends positions while people move; when they pause, zones follow the sensor's own presence: nobody in the room empties every zone, and while someone is there, zones keep their last state. The card's badge then says **Positions paused**. Zones are only "unknown" when the sensor has sent neither, for example right after a restart or while it is offline. If the badge says **Positions unavailable** for long, set **Mounted on** and **Wall position** in ⚙ Settings.
 - **A dot nobody is standing on.** Click it and choose **Forget this target**; if it keeps coming back, **Ignore this spot**.
+- **A zone stays occupied with nobody there.** In ⚙ Settings, set **Forget still dots after** to a number of minutes (`number.<fp400>_forget_still_targets`). A dot that hasn't moved at all for that long is forgotten; a real person is picked up again. People asleep can lie that still for over an hour, so in a bedroom use a long time or leave it at 0 (off).
 
 ## Changelog
 
