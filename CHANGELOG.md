@@ -7,6 +7,8 @@ To update, get the new card through HACS and copy the new `z2m/aqara-fp400.mjs` 
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-29
+
 ### Added
 
 - **Forget still dots after** (⚙ Settings, `forget_still_targets`): the sensor is told to forget a target whose dot hasn't moved at all for the minutes you choose, usually a ghost that keeps a zone occupied ([#4](https://github.com/bobtekkk/aqara-fp400-zone-card/issues/4)). A real person is picked up again. It's off (0) until you set it. People asleep can lie that still for over an hour, so use a long time in a bedroom. Thanks to [@satmandu](https://github.com/satmandu) for the idea.
@@ -14,7 +16,7 @@ To update, get the new card through HACS and copy the new `z2m/aqara-fp400.mjs` 
 
 ### Fixed
 
-- Areas and settings survive a power cut. The FP400 forgets its ignore spots, doorways, outside-room areas and mounting (wall or ceiling, wall position, height) when it loses power; a Zigbee2MQTT restart doesn't affect them. The converter now keeps every setting you save with the sensor and puts back whatever the sensor lost when it comes back. Settings made with an older version are taken over from the sensor the first time Zigbee2MQTT starts with this one. An area the sensor changed itself (for example with **Find fake-target spots itself**) is left alone; only an empty one is filled in again.
+- Areas and settings survive a power cut. The FP400 forgets its ignore spots, doorways, outside-room areas and mounting (wall or ceiling, wall position, height) when it loses power; a Zigbee2MQTT restart doesn't affect them. The converter now keeps every setting you save with the sensor and puts back whatever the sensor lost when it comes back. Settings made with an older version are taken over from the sensor the first time Zigbee2MQTT starts with this one. An area the sensor changed itself (for example with **Find fake-target spots itself**) is left alone; only an empty one is filled in again. A sensor that already lost them before you update has nothing to take over: after updating, check ⚙ Settings, and if **Mounted on** says unknown, set your mounting and areas once more.
 - A native zone's own timeout (`zone_N_absence_timeout`) can be set to 0 seconds, like the room's since 0.4.1.
 
 ### Changed
@@ -96,7 +98,8 @@ To update, get the new card through HACS and copy the new `z2m/aqara-fp400.mjs` 
 - Interference blocks, written to the sensor's own interference area.
 - Zigbee2MQTT converter (`z2m/aqara-fp400.mjs`): software zones, interference blocks, position tracking and the sensor's settings.
 
-[Unreleased]: https://github.com/bobtekkk/aqara-fp400-zone-card/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/bobtekkk/aqara-fp400-zone-card/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/bobtekkk/aqara-fp400-zone-card/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/bobtekkk/aqara-fp400-zone-card/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/bobtekkk/aqara-fp400-zone-card/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/bobtekkk/aqara-fp400-zone-card/compare/v0.2.1...v0.3.0
