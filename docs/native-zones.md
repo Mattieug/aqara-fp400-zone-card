@@ -81,4 +81,3 @@ These examples come from passive M3 captures on 22 October 2026. Malformed, trun
 This converter does not implement APS reassembly. Per-zone writes and the small ChildEndpointList/ZoneID reads avoid needing the full catalogue to edit known zones. Native occupancy/count reports are independent of coordinate tracking; the live positions and software zones retain their existing limitations.
 
 The wire fixtures and automated tests validate encoding, decoding, confirmation, and editor behavior. The new Zigbee2MQTT integration still needs end-to-end validation on an FP400/coordinator; M3/Homey captures do not replace that check.
-
