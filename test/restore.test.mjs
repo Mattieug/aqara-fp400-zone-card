@@ -160,3 +160,15 @@ test('zone slot settings are kept too', async () => {
     await announce(device); await fp400Poll(device);
     assert.equal(device.attr(3, 128, 0), 0);
 });
+
+test('legacy settings do not follow a reused endpoint into another native zone', async () => {
+    const device = fakeSensor('restore-zone-reassigned');
+    device.setAttr(3, 'aqaraFp400Radar', 1, 1);
+    device.setAttr(3, 128, 0, 1);
+    await fp400Poll(device);
+    await set('zone_1_sensitivity', 'low', device);
+    device.setAttr(3, 'aqaraFp400Radar', 1, 2);
+    device.setAttr(3, 128, 0, 1);
+    await announce(device); await fp400Poll(device);
+    assert.equal(device.attr(3, 128, 0), 1, 'zone 2 keeps its own sensitivity');
+});

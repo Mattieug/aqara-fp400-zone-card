@@ -120,6 +120,10 @@ const cellBox = (page, type) => page.evaluate(type => {
     return cs.length ? [Math.min(...cs.map(c => c.x)), Math.max(...cs.map(c => c.x + 50)), Math.min(...cs.map(c => c.y)), Math.max(...cs.map(c => c.y + 50))] : null;
 }, type);
 
+async function nativeMode(page){
+    await btn(page,'zone-mode').click();
+    await page.evaluate(()=>{const c=document.querySelector('fp400-zone-card');c.view={x:-400,y:-50,width:800,height:900};c.render();});
+}
 const scenarios = {
     async A() { // drawn and then cancelled: nothing stays behind
         const page = await open();
@@ -540,6 +544,64 @@ const scenarios = {
         const row = await page.locator('fp400-zone-card .zone-row[data-zone="1"] small').textContent();
         check('Z1 the Desk row says one person, still', row === 'Occupied · 1 person, still', row);
         noErrors('Z2', page); await page.close();
+    },
+    async NS() { // native cells and telemetry use their own entities, including renamed ones
+        const page = await open('?native=1&renamed=1&latency=200&held=1');
+        check('NS1 software remains the default', await btn(page, 'zone-mode').textContent() === 'Software zones');
+        await nativeMode(page);
+        await page.locator('fp400-zone-card .zone-row[data-zone="1"]').click();
+        const before = await page.evaluate(() => { const c=document.querySelector('fp400-zone-card');return {mask:c.saved[1].mask_hex,row:c.shadowRoot.querySelector('.zone-row[data-zone="1"] small').textContent}; });
+        check('NS2 native occupancy and count work while positions are paused', before.row === 'Occupied · 2 people', before);
+        check('NS3 the non-rectangular mask keeps its hole', await page.locator('fp400-zone-card #zones [data-map-zone="1"] rect').count() === 8);
+        const name=page.locator('fp400-zone-card input[data-field="name"]');await name.fill('Sensor office');await name.press('Enter');
+        check('NS4 switching is disabled while native edits are unsaved', await btn(page,'zone-mode').isDisabled());
+        await btn(page,'save').click();
+        check('NS5 a successful HA call alone does not finish the save', (await st(page)).saving);
+        await waitIdle(page);
+        let sent=await page.evaluate(()=>window.__sim.calls.at(-1));
+        check('NS6 rename keeps every mask bit and addresses the renamed native entity', sent.entity_id==='text.kitchen_native_configuration'&&JSON.parse(sent.value).mask_hex===before.mask,sent);
+        await page.locator('fp400-zone-card [data-action="native-paint"][data-tool="add"]').click();
+        await drag(page,[-100,200],[-50,250]);
+        await page.locator('fp400-zone-card [data-action="native-paint"][data-tool="remove"]').click();
+        await drag(page,[50,200],[100,250]);
+        await btn(page,'save').click();await waitIdle(page);
+        sent=await page.evaluate(()=>window.__sim.calls.at(-1));
+        check('NS7 paint and erase preserve the other cells and hole', sameBits(maskSet(JSON.parse(sent.value).mask_hex),new Set([71,72,73,86,88,102,103,104])),sent);
+        await btn(page,'zone-mode').click();
+        const software=await page.evaluate(()=>document.querySelector('fp400-zone-card').drafts[1]);
+        check('NS8 software geometry and name are preserved', software.name==='Desk'&&software.x_min===-115,software);
+        noErrors('NS9',page);await page.close();
+    },
+    async NT() { // an unknown sensor zone requires explicit authorization, including deletion
+        for(const remove of [false,true]){
+            const page=await open('?native=1&latency=100');await nativeMode(page);
+            await page.locator('fp400-zone-card .zone-row[data-zone="2"]').click();
+            if(remove)await btn(page,'delete').click();
+            else {await page.locator('fp400-zone-card [data-action="native-paint"][data-tool="add"]').click();await drag(page,[200,400],[300,500]);}
+            await btn(page,'save').click();
+            check(`NT1 ${remove?'delete':'replace'} is blocked before confirmation`,(await page.evaluate(()=>window.__sim.calls.length))===0&&/Confirm/.test((await st(page)).message));
+            await page.locator('fp400-zone-card input[data-overwrite="2"]').check();await btn(page,'save').click();await waitIdle(page);
+            const sent=await page.evaluate(()=>window.__sim.calls.at(-1));const value=JSON.parse(sent.value);
+            check(`NT2 ${remove?'delete':'replace'} sends explicit overwrite`,value.overwrite===true&&(remove?value.clear===true:maskSet(value.mask_hex).size===4),sent);
+            noErrors('NT3',page);await page.close();
+        }
+    },
+    async NF() { // failed writes retain the intended mask and require confirmation before retrying uncertainty
+        const page=await open('?native=1&latency=100');await nativeMode(page);await page.locator('fp400-zone-card .zone-row[data-zone="1"]').click();
+        const name=page.locator('fp400-zone-card input[data-field="name"]');await name.fill('Retry desk');await name.press('Enter');
+        await page.evaluate(()=>{window.__sim.nativeFail='Sensor refused';});await btn(page,'save').click();await waitIdle(page);
+        check('NF1 failure keeps edits and explains the error',/Sensor refused/.test((await st(page)).message)&&!(await btn(page,'save').isDisabled()));
+        await page.locator('fp400-zone-card input[data-overwrite="1"]').check();await page.evaluate(()=>{window.__sim.nativeFail='';});await btn(page,'save').click();await waitIdle(page);
+        check('NF2 explicit retry succeeds',/^Saved/.test((await st(page)).message)&&(await btn(page,'save').isDisabled()));
+        noErrors('NF3',page);await page.close();
+    },
+    async NC() { // drawing uses only a confirmed free native slot
+        const page=await open('?native=1&latency=100');await nativeMode(page);await btn(page,'draw').click();await drag(page,[-300,400],[-200,500]);
+        const selected=await page.evaluate(()=>document.querySelector('fp400-zone-card').selected);
+        check('NC1 drawing skips the unmanaged native ID',selected===3,selected);
+        await btn(page,'save').click();await waitIdle(page);
+        const sent=await page.evaluate(()=>window.__sim.calls.at(-1));check('NC2 new native mask goes to that slot',sent.entity_id==='text.0x54ef440000000001_native_zone_3_config'&&maskSet(JSON.parse(sent.value).mask_hex).size===4,sent);
+        noErrors('NC3',page);await page.close();
     },
 };
 

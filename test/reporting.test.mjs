@@ -10,7 +10,7 @@ function fakeSensor({zones = [], zonesReadable = true, lightFails = false} = {})
     const table = new Set(['1/msOccupancySensing', '3/msOccupancySensing', '4/msOccupancySensing', '5/msOccupancySensing', '6/msOccupancySensing']);
     const reads = [];
     const device = {
-        meta: {}, saves: 0, table, reads,
+        ieeeAddr: `report-${Math.random()}`, meta: {}, saves: 0, table, reads,
         save() {this.saves++;},
         getEndpoint: id => ({
             bind: async () => {},
@@ -24,6 +24,10 @@ function fakeSensor({zones = [], zonesReadable = true, lightFails = false} = {})
             },
             read: async (cluster, attributes) => {
                 reads.push(`${id}/${cluster}`);
+                if (cluster === 'aqaraFp400Radar' && attributes[0] !== 'humanCount') {
+                    if (!zonesReadable) throw new Error('Timeout');
+                    return attributes[0] === 0 ? {0: zones.map(zone => zone + 2)} : {1: id - 2};
+                }
                 if (cluster === 'aqaraFp400Config') {
                     if (!zonesReadable) throw new Error('Timeout');
                     return {16: zones.map(zone)};
@@ -38,7 +42,7 @@ function fakeSensor({zones = [], zonesReadable = true, lightFails = false} = {})
 const polled = async device => {
     device.reads.length = 0;
     await fp400UnreportedPoll(device).catch(() => {});
-    return device.reads.map(read => Number(read.split('/')[0]));
+    return device.reads.filter(read => !read.includes('aqaraFp400Radar')).map(read => Number(read.split('/')[0]));
 };
 
 test('without native zones the light gets a report entry and no zone endpoint is polled', async () => {
@@ -82,7 +86,7 @@ test('a sensor set up by converter 0.4 keeps the old polling until configure run
 test('a failed light read still polls the zones and is reported', async () => {
     const device = fakeSensor({lightFails: true});
     await assert.rejects(fp400UnreportedPoll(device), /Timeout/);
-    assert.deepEqual(device.reads.map(read => Number(read.split('/')[0])), [2, 7, 8, 9, 10]);
+    assert.deepEqual(device.reads.filter(read => !read.includes('aqaraFp400Radar')).map(read => Number(read.split('/')[0])), [2, 7, 8, 9, 10]);
 });
 
 test('native zone ids are read from plain or struct records', () => {

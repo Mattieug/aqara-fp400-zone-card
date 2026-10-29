@@ -1,6 +1,7 @@
 // Aqara FP400 (lumi.models.4447_8295) external converter for Zigbee2MQTT 2.x: software presence zones,
 // interference blocks and position tracking. Builds on the community converter by jcastro (Zigbee2MQTT issue #33146).
 // https://github.com/bobtekkk/aqara-fp400-zone-card (MIT License)
+import {Zcl} from 'zigbee-herdsman';
 import * as m from 'zigbee-herdsman-converters/lib/modernExtend';
 import * as exposes from 'zigbee-herdsman-converters/lib/exposes';
 import {logger} from 'zigbee-herdsman-converters/lib/logger';
@@ -12,6 +13,7 @@ const aqaraHumanCount = {
     cluster: 'aqaraFp400Radar',
     type: ['attributeReport', 'readResponse'],
     convert: (model, msg) => {
+        if (msg.endpoint.ID !== 1) return;
         const count = msg.data.humanCount ?? msg.data[2];
         return typeof count === 'number' ? {human_count: count} : undefined;
     },
@@ -289,6 +291,8 @@ export async function restoreSettings(device) {
     const order = setting => {const index = restorable.findIndex(known => savedKey(known) === savedKey(setting));return index < 0 ? restorable.length : index;};
     for (const setting of Object.values(saved).sort((a, b) => order(a) - order(b))) {
         try {
+            const zone = /^zone_(\d+)_(?:sensitivity|absence_timeout)$/.exec(setting.name);
+            if (zone && (await device.getEndpoint(setting.endpoint).read('aqaraFp400Radar', [1], manufacturerOptions))[1] !== Number(zone[1])) continue;
             const current = await readSetting(device, setting);
             if (current === setting.value || (isMask(setting) && (!emptyMask(current) || emptyMask(setting.value)))) continue;
             const value = isMask(setting) ? Buffer.from(setting.value, 'hex') : setting.value;
@@ -577,6 +581,187 @@ const fp400ZoneExposes = [
     e.numeric('maximum_detection_targets', ea.STATE_GET).withCategory('diagnostic')
         .withDescription('Device-reported tracking capacity; not the current people count'),
 ];
+
+// Native geometry is acknowledged by the sensor; software rectangles remain independent.
+const nativeContexts = new Map();
+function nativeContext(device) {
+    let context = nativeContexts.get(device.ieeeAddr);
+    if (!context) {context = {endpoints: null, readings: {}, error: ''}; nativeContexts.set(device.ieeeAddr, context);}
+    return context;
+}
+export function parseNativeZone(value) {
+    if (typeof value === 'string' && value.length > 255) throw new Error('Native zone JSON must fit 255 characters');
+    const input = value === 'clear' ? {clear: true} : typeof value === 'string' ? JSON.parse(value) : value;
+    if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('Native zone must be a JSON object or clear');
+    if (input.overwrite !== undefined && input.overwrite !== true) throw new Error('overwrite must be true when explicitly replacing an unmanaged zone');
+    if (input.clear === true && Object.keys(input).some(key => !['clear', 'overwrite'].includes(key))) throw new Error('Clear cannot include zone geometry');
+    if (input.clear === true) return {config: null, overwrite: input.overwrite === true};
+    if (typeof input.name !== 'string' || !input.name.trim() || input.name.length > 32) throw new Error('Zone name must be 1..32 characters and not blank');
+    if (typeof input.mask_hex !== 'string' || !/^[0-9a-f]{80}$/i.test(input.mask_hex) || !/[^0]/.test(input.mask_hex)) throw new Error('Native mask must contain 80 hex characters and at least one selected cell');
+    if (!Number.isInteger(input.absence_timeout) || input.absence_timeout < 0 || input.absence_timeout > 300) throw new Error('Native zone absence timeout must be 0..300 seconds');
+    const config = {name: input.name, mask_hex: input.mask_hex.toLowerCase(), absence_timeout: input.absence_timeout};
+    if (JSON.stringify({...config, ...(input.overwrite ? {overwrite: true} : {})}).length > 255) throw new Error('Native zone JSON must fit 255 characters');
+    return {config, overwrite: input.overwrite === true};
+}
+export async function readNativeZoneMap(device) {
+    const context = nativeContext(device);
+    try {
+        const raw = (await device.getEndpoint(1).read('aqaraFp400Radar', [0], manufacturerOptions))[0];
+        if (!Array.isArray(raw) || raw.some(ep => !Number.isInteger(ep) || ep < 3 || ep > 240) || new Set(raw).size !== raw.length) throw new Error('Sensor did not return a complete native endpoint list');
+        const endpoints = new Map();
+        for (const endpoint of raw) {
+            const id = (await device.getEndpoint(endpoint).read('aqaraFp400Radar', [1], manufacturerOptions))[1];
+            if (!Number.isInteger(id) || id < 0 || id > 255 || endpoints.has(id)) throw new Error('Sensor returned an invalid or ambiguous native zone ID');
+            endpoints.set(id, endpoint);
+        }
+        for (const id of Object.keys(context.readings)) if (context.endpoints?.get(Number(id)) !== endpoints.get(Number(id))) delete context.readings[id];
+        context.endpoints = endpoints; context.error = '';
+        return endpoints;
+    } catch (error) {
+        context.endpoints = null; context.readings = {}; context.error = error.message;
+        throw error;
+    }
+}
+export function nativeZoneState(device) {
+    const context = nativeContext(device), state = {};
+    for (let id = 1; id <= 8; id++) {
+        const key = `native_zone_${id}`, record = device.meta?.fp400NativeZones?.[id];
+        const known = context.endpoints !== null, exists = context.endpoints?.has(id);
+        const confirmed = record?.status === 'ready' && known && exists === (record.config !== null);
+        state[`${key}_config`] = confirmed ? record.config === null ? 'clear' : JSON.stringify(record.config) : known && !exists && !record ? 'clear' : 'unmanaged';
+        state[`${key}_status`] = record?.status === 'pending' ? 'pending' : record?.status === 'error' || context.error ? 'error' : 'ready';
+        state[`${key}_error`] = (record?.error || context.error || '').slice(0, 255);
+        state[`${key}_occupancy`] = known && exists ? context.readings[id]?.occupancy ?? null : null;
+        state[`${key}_count`] = known && exists ? context.readings[id]?.count ?? null : null;
+    }
+    return state;
+}
+const fp400NativeReport = {
+    cluster: 'msOccupancySensing', type: ['attributeReport', 'readResponse'],
+    convert: (model, msg) => {
+        const context = nativeContext(msg.device);
+        const id = [...(context.endpoints ?? [])].find(([, endpoint]) => endpoint === msg.endpoint.ID)?.[0];
+        if (id === undefined || id < 1 || id > 8) return;
+        const readings = context.readings[id] ??= {};
+        const count = msg.data.humanCount ?? msg.data[2];
+        if (msg.cluster === 'msOccupancySensing' && Number.isInteger(msg.data.occupancy)) readings.occupancy = (msg.data.occupancy & 1) !== 0;
+        else if (['aqaraFp400Radar', '64523'].includes(String(msg.cluster)) && Number.isInteger(count)) readings.count = count;
+        else return;
+        return nativeZoneState(msg.device);
+    },
+};
+async function readNativeReadings(device, endpoints) {
+    const context = nativeContext(device);
+    for (const [id, endpoint] of endpoints) {
+        if (id < 1 || id > 8) continue;
+        for (const [cluster, attribute, key] of [['msOccupancySensing', 'occupancy', 'occupancy'], ['aqaraFp400Radar', 'humanCount', 'count']]) {
+            try {
+                const raw = (await device.getEndpoint(endpoint).read(cluster, [attribute], key === 'count' ? manufacturerOptions : {}))[attribute];
+                if (Number.isInteger(raw)) (context.readings[id] ??= {})[key] = key === 'occupancy' ? (raw & 1) !== 0 : raw;
+            } catch { /* an unavailable reading is not zero */ }
+        }
+    }
+}
+const fp400NativeControl = {
+    key: Array.from({length: 8}, (_, i) => `native_zone_${i + 1}_config`),
+    convertGet: async (entity, key, meta) => {
+        try {await withDeviceLock(meta.device, async () => {const endpoints = await readNativeZoneMap(meta.device); await readNativeReadings(meta.device, endpoints);});}
+        finally {meta.publish(nativeZoneState(meta.device));}
+    },
+    convertSet: async (entity, key, value, meta) => {
+        const id = Number(key.split('_')[2]), {config, overwrite} = parseNativeZone(value), device = meta.device;
+        return withDeviceLock(device, async () => {
+            const context = nativeContext(device), previous = device.meta.fp400NativeZones?.[id];
+            let pending = false;
+            try {
+                const endpoints = await readNativeZoneMap(device), endpoint = endpoints.get(id);
+                if (endpoint !== undefined && (!previous || previous.config === null) && !overwrite) throw new Error('Native zone already exists outside this card; confirm overwrite first');
+                if (config && endpoint === undefined) {
+                    const maximum = (await device.getEndpoint(1).read(configCluster, [17], manufacturerOptions))[17];
+                    if (!Number.isInteger(maximum) || maximum < 1 || endpoints.size >= maximum) throw new Error('Native zone capacity is unavailable or full');
+                }
+                const record = {config, status: 'pending', error: ''};
+                device.meta.fp400NativeZones = {...device.meta.fp400NativeZones, [id]: record};
+                // Legacy timeout restoration belongs to its former zone, not a reused endpoint.
+                const saved = {...device.meta.fp400Saved};
+                for (const [savedId, setting] of Object.entries(saved)) if (setting.name === `zone_${id}_absence_timeout`) delete saved[savedId];
+                device.meta.fp400Saved = saved;
+                await device.save(); pending = true;
+                delete context.readings[id];
+                meta.publish(nativeZoneState(device));
+                if (config || endpoint !== undefined) {
+                    const command = config ? endpoint === undefined ? 'appendZone' : 'updateZone' : 'removeZone';
+                    const args = config ? {zone: [{elmType: 0x20, elmVal: id}, {elmType: 0x30, elmVal: 0},
+                        {elmType: 0x41, elmVal: Buffer.from(config.mask_hex, 'hex')}, {elmType: 0x10, elmVal: 1}]} : {zoneId: id};
+                    const result = await device.getEndpoint(1).command(configCluster, command, args, {...manufacturerOptions, disableDefaultResponse: false, disableResponse: false});
+                    if (result?.errorCode !== 0) throw new Error(`Native ${command} was not acknowledged: ${JSON.stringify(result)}`);
+                }
+                const after = await readNativeZoneMap(device), targetEndpoint = after.get(id);
+                if (config) {
+                    if (targetEndpoint === undefined) throw new Error('Native zone has no endpoint after the command');
+                    await device.getEndpoint(targetEndpoint).write('msOccupancySensing', {3: {value: config.absence_timeout, type: 0x21}});
+                    const readback = await device.getEndpoint(targetEndpoint).read('msOccupancySensing', [3]);
+                    if (readback[3] !== config.absence_timeout) throw new Error('Native zone timeout was not confirmed');
+                } else if (targetEndpoint !== undefined) throw new Error('Native zone still exists after removal');
+                const coordinator = context.coordinator ?? device.getEndpoint(1).binds.find(bind => bind.cluster.ID === 0x0406)?.target;
+                if (!coordinator) throw new Error('Reconfigure the device to create its coordinator binding');
+                await configureNativeReporting(device, coordinator);
+                await readNativeReadings(device, after);
+                device.meta.fp400NativeZones[id] = {...record, status: 'ready'};
+                await device.save();
+                return {state: nativeZoneState(device)};
+            } catch (error) {
+                if (pending || device.meta.fp400NativeZones?.[id] !== previous) {
+                    device.meta.fp400NativeZones[id].status = 'error';
+                    device.meta.fp400NativeZones[id].error = error.message;
+                    try {await device.save();} catch { /* retain uncertainty in memory as well */ }
+                }
+                meta.publish({...nativeZoneState(device), [`native_zone_${id}_status`]: 'error', [`native_zone_${id}_error`]: error.message.slice(0, 255)});
+                throw error;
+            }
+        });
+    },
+};
+const nativeZoneExposes = Array.from({length: 8}, (_, i) => {
+    const key = `native_zone_${i + 1}`;
+    return [e.text(`${key}_config`, ea.ALL).withCategory('config').withDescription('Sensor zone JSON: name, mask_hex (80 hex characters), absence_timeout. clear removes it. Use overwrite:true to replace an unmanaged ID.'),
+        e.enum(`${key}_status`, ea.STATE, ['ready', 'pending', 'error']).withCategory('diagnostic'),
+        e.text(`${key}_error`, ea.STATE).withCategory('diagnostic'),
+        e.binary(`${key}_occupancy`, ea.STATE, true, false).withDescription('Presence reported by this native sensor zone; independent of software zones'),
+        e.numeric(`${key}_count`, ea.STATE).withDescription('People reported by this native sensor zone')];
+}).flat();
+// Captured Aqara 8A records carry the same scalar values as Report Attributes.
+export function decodeAttributeSync(cluster, data) {
+    if (!Buffer.isBuffer(data) || data.length < 5 || ![0x0c, 0x1c].includes(data[0]) || data.readUInt16LE(1) !== 0x115f || data[4] !== 0x8a) return;
+    const fields = {msOccupancySensing: {0: [0x18, 1, 'occupancy'], 3: [0x21, 2, '3']},
+        msIlluminanceMeasurement: {0: [0x21, 2, 'measuredValue']},
+        aqaraFp400Radar: {2: [0x21, 2, 'humanCount']}, aqaraFp400Location: {7: [0x30, 1, 'activityState']}};
+    const names = {'1030': 'msOccupancySensing', '1024': 'msIlluminanceMeasurement', '64523': 'aqaraFp400Radar', '64524': 'aqaraFp400Location'};
+    const schema = fields[names[cluster] ?? cluster], values = {};
+    if (!schema || data.length === 5) return;
+    for (let offset = 5; offset < data.length;) {
+        if (offset + 3 > data.length) return;
+        const id = data.readUInt16LE(offset), field = schema[id];
+        if (!field || data[offset + 2] !== field[0] || offset + 3 + field[1] > data.length) return;
+        values[field[2]] = values[id] = field[1] === 1 ? data[offset + 3] : data.readUInt16LE(offset + 3);
+        offset += 3 + field[1];
+    }
+    return values;
+}
+const attributeSyncConverters = ['msOccupancySensing', 'msIlluminanceMeasurement', 'aqaraFp400Radar', 'aqaraFp400Location', 64523, 64524].map(cluster => ({
+    cluster, type: ['raw'],
+    convert: async (model, msg, publish, options, meta) => {
+        const data = decodeAttributeSync(cluster, msg.data);
+        if (!data) return;
+        const report = {...msg, cluster: ({64523: 'aqaraFp400Radar', 64524: 'aqaraFp400Location'})[msg.cluster] ?? msg.cluster, type: 'attributeReport', data, meta: {...msg.meta, zclTransactionSequenceNumber: msg.data[3]}};
+        const state = {};
+        for (const converter of model.fromZigbee) {
+            if (String(converter.cluster) === String(report.cluster) && converter.type.includes('attributeReport')) Object.assign(state, await converter.convert(model, report, publish, options, meta));
+        }
+        return state;
+    },
+}));
+
 // FC0C event 0: the target list. Records follow the Matter LocationInfo order: id, x, y, cell (row << 8 | col),
 // activity (1 moving, 2 still), fall, posture, zone id, in-zone id.
 // Ember coordinators pass on only the first 80 bytes (zigbee-herdsman#1886), which cuts reports with 3 or more targets.
@@ -815,7 +1000,7 @@ const softwareZoneHeartbeat={
     cluster:'aqaraFp400Radar',type:['attributeReport','readResponse'],
     convert:(model,msg,publish)=>{
         if(msg.endpoint.ID!==1)return;
-        return {...zoneState(softwareContext(msg.device,publish)), map_rotation:msg.device.meta.fp400MapRotation ?? 0,
+        return {...nativeZoneState(msg.device), ...zoneState(softwareContext(msg.device,publish)), map_rotation:msg.device.meta.fp400MapRotation ?? 0,
             forget_still_targets:msg.device.meta.fp400ForgetStill ?? 0};
     },
 };
@@ -949,36 +1134,44 @@ export function nativeZoneIds(value) {
 }
 // The FP400's reporting table holds five entries. Room presence takes the first (m.occupancy on endpoint 1), then
 // the native zones the sensor actually has, then the light sensor. Whatever gets no entry is polled.
+async function configureNativeReporting(device, coordinatorEndpoint) {
+    const context = nativeContext(device);
+    context.coordinator = coordinatorEndpoint;
+    let zones = null, endpoints = null;
+    try {endpoints = await readNativeZoneMap(device); zones = [...endpoints.keys()];} catch {}
+    const occupancy = max => [{attribute: 'occupancy', minimumReportInterval: 0, maximumReportInterval: max, reportableChange: 0}];
+    // Converter 0.4 and older reported endpoints 3-6. A maximum interval of 0xFFFF stops a report and frees its entry.
+    const unused = endpoints ? zoneSlots.filter(({endpoint}) => ![...endpoints.values()].includes(endpoint)) : [];
+    for (const {endpoint} of unused) {
+        try {await device.getEndpoint(endpoint).configureReporting('msOccupancySensing', occupancy(0xffff));} catch {}
+    }
+    const reported = [];
+    const report = async (id, cluster, items) => {
+        try {
+            const endpoint = device.getEndpoint(id);
+            await endpoint.bind(cluster, coordinatorEndpoint);
+            await endpoint.configureReporting(cluster, items);
+            reported.push(id);
+        } catch { /* table full (INSUFFICIENT_SPACE): polled instead */ }
+    };
+    for (const endpoint of endpoints ? endpoints.values() : zoneSlots.map(slot => slot.endpoint)) {
+        await report(endpoint, 'msOccupancySensing', occupancy(3600));
+        try {await device.getEndpoint(endpoint).bind('aqaraFp400Radar', coordinatorEndpoint);} catch { /* count remains readable */ }
+    }
+    await report(2, 'msIlluminanceMeasurement', [{attribute: 'measuredValue', minimumReportInterval: 10, maximumReportInterval: 3600, reportableChange: 5}]);
+    device.meta.fp400Reporting = {reported, zones};
+    device.save();
+}
 export const fp400ReportingSlots = {
     isModernExtend: true,
-    configure: [async (device, coordinatorEndpoint) => {
-        let zones = null;
-        try {zones = nativeZoneIds((await device.getEndpoint(1).read(configCluster, [16], manufacturerOptions))[16]);} catch {}
-        const occupancy = max => [{attribute: 'occupancy', minimumReportInterval: 0, maximumReportInterval: max, reportableChange: 0}];
-        // Converter 0.4 and older reported endpoints 3-6. A maximum interval of 0xFFFF stops a report and frees its entry.
-        const unused = zones ? zoneSlots.filter(({zone}) => !zones.includes(zone)) : [];
-        for (const {endpoint} of unused) {
-            try {await device.getEndpoint(endpoint).configureReporting('msOccupancySensing', occupancy(0xffff));} catch {}
-        }
-        const reported = [];
-        const report = async (id, cluster, items) => {
-            try {
-                const endpoint = device.getEndpoint(id);
-                await endpoint.bind(cluster, coordinatorEndpoint);
-                await endpoint.configureReporting(cluster, items);
-                reported.push(id);
-            } catch { /* table full (INSUFFICIENT_SPACE): polled instead */ }
-        };
-        for (const {endpoint} of zoneSlots.filter(slot => !unused.includes(slot))) await report(endpoint, 'msOccupancySensing', occupancy(3600));
-        await report(2, 'msIlluminanceMeasurement', [{attribute: 'measuredValue', minimumReportInterval: 10, maximumReportInterval: 3600, reportableChange: 5}]);
-        device.meta.fp400Reporting = {reported, zones};
-        device.save();
-    }],
+    configure: [(device, coordinatorEndpoint) => withDeviceLock(device, () => configureNativeReporting(device, coordinatorEndpoint))],
 };
 // Zone endpoints without a report entry; before the converter shared out the entries, 3-6 had them.
 function polledZoneEndpoints(device) {
     const reporting = device.meta?.fp400Reporting;
     if (!reporting) return [7, 8, 9, 10];
+    const endpoints = nativeContext(device).endpoints;
+    if (endpoints) return [...endpoints.values()].filter(endpoint => !reporting.reported.includes(endpoint));
     return zoneSlots.filter(({zone, endpoint}) => !reporting.reported.includes(endpoint) && (!reporting.zones || reporting.zones.includes(zone)))
         .map(({endpoint}) => endpoint);
 }
@@ -986,10 +1179,17 @@ export async function fp400UnreportedPoll(device) {
     // The light is read even when reported, and first, so slow or missing zone endpoints can't hold it up.
     let failure;
     try {await device.getEndpoint(2).read('msIlluminanceMeasurement', ['measuredValue']);} catch (error) {failure = error;}
-    // An unused or temporarily unavailable zone must not block the others.
-    for (const id of polledZoneEndpoints(device)) {
-        try {await device.getEndpoint(id).read('msOccupancySensing', ['occupancy']);} catch {}
-    }
+    await withDeviceLock(device, async () => {
+        let endpoints;
+        try {endpoints = await readNativeZoneMap(device);} catch { /* keep independent light and occupancy reads */ }
+        // An unused or temporarily unavailable zone must not block the others.
+        for (const id of polledZoneEndpoints(device)) {
+            try {await device.getEndpoint(id).read('msOccupancySensing', ['occupancy']);} catch {}
+        }
+        for (const endpoint of endpoints?.values() ?? []) {
+            try {await device.getEndpoint(endpoint).read('aqaraFp400Radar', ['humanCount'], manufacturerOptions);} catch { /* preserve other readings */ }
+        }
+    });
     if (failure) throw failure;
 }
 
@@ -1014,13 +1214,15 @@ export default {
         {...aqaraHumanCount, cluster: '64523'},
         aqaraActivityState,
         {...aqaraActivityState, cluster: '64524'},
+        fp400NativeReport, {...fp400NativeReport, cluster: 'aqaraFp400Radar'}, {...fp400NativeReport, cluster: '64523'},
+        ...attributeSyncConverters,
     ],
-    toZigbee: [softwareZoneControl, fp400MapRotation, fp400ForgetStill, fp400RemoveTarget, fp400ZoneSettingsControl, fp400CapacityGet,
+    toZigbee: [fp400NativeControl, softwareZoneControl, fp400MapRotation, fp400ForgetStill, fp400RemoveTarget, fp400ZoneSettingsControl, fp400CapacityGet,
         ...fp400InstallationControl.key.map(key => ({...fp400InstallationControl, key: [key]})),
         ...fp400RegionControl.key.map(key => ({...fp400RegionControl, key: [key]})),
         ...fp400RegionGet.key.map(key => ({...fp400RegionGet, key: [key]})),
         ...fp400AreaControl.key.map(key => ({...fp400AreaControl, key: [key]})), fp400Refresh, ...Object.keys(configOptions).map((key) => ({...fp400ConfigControl, key: [key]})), fp400Learning, fp400SensitivityControl, fp400AbsenceControl, fp400DepthControl],
-    exposes: [...softwareZoneExposes, ...fp400TrackingExposes,
+    exposes: [...nativeZoneExposes, ...softwareZoneExposes, ...fp400TrackingExposes,
         ...fp400ZoneExposes,
         ...fp400AdditionalExposes,
         e.numeric('detection_depth', ea.ALL).withUnit('m').withValueMin(0.5).withValueMax(10).withValueStep(0.5).withCategory('config')
@@ -1041,8 +1243,21 @@ export default {
     ],
     // Tracking (re)starts from the 10 s poll below: on 'start' this hook runs before the custom clusters exist.
     onEvent: async(event)=>{
+        if (event.type === 'start') {
+            let interrupted = false;
+            for (const record of Object.values(event.data.device.meta.fp400NativeZones ?? {})) {
+                if (record.status === 'pending') {record.status = 'error'; record.error = 'Native zone save was interrupted; retry to confirm geometry'; interrupted = true;}
+            }
+            if (interrupted) await event.data.device.save();
+        }
+        if (event.type === 'deviceInterview' && event.data.status === 'successful') {
+            await event.data.device.getEndpoint(1).write(0xfcc0, {0x00a0: {value: 1, type: 0x20}}, {...manufacturerOptions, disableDefaultResponse: false});
+        }
         // The sensor announces itself when power returns, with its areas and mounting forgotten.
-        if(event.type==='deviceAnnounce') restoreChecked.delete(event.data.device.ieeeAddr);
+        if(event.type==='deviceAnnounce') {
+            restoreChecked.delete(event.data.device.ieeeAddr);
+            const context = nativeContext(event.data.device); context.endpoints = null; context.readings = {};
+        }
         if(event.type==='stop') {
             const context=softwareZoneContexts.get(event.data.ieeeAddr);
             if(context)clearInterval(context.timer);
@@ -1050,6 +1265,7 @@ export default {
             deviceLocks.delete(event.data.ieeeAddr);
             regionsReadAt.delete(event.data.ieeeAddr);
             restoreChecked.delete(event.data.ieeeAddr);
+            nativeContexts.delete(event.data.ieeeAddr);
         }
     },
     extend: [
@@ -1057,8 +1273,12 @@ export default {
             name: configCluster, ID: 64522, manufacturerCode: 0x115f,
             attributes: Object.fromEntries(Object.entries(configOptions).map(([key, option]) =>
                 [key, {ID: option.id, name: key, type: option.type, write: true}])),
-            commands: {startLearning: {ID: 3, name: 'startLearning', parameters: []}},
-            commandsResponse: {},
+            commands: {startLearning: {ID: 3, name: 'startLearning', parameters: []},
+                appendZone: {ID: 4, name: 'appendZone', response: 5, parameters: [{name: 'zone', type: Zcl.DataType.STRUCT}]},
+                updateZone: {ID: 6, name: 'updateZone', response: 7, parameters: [{name: 'zone', type: Zcl.DataType.STRUCT}]},
+                removeZone: {ID: 8, name: 'removeZone', response: 9, parameters: [{name: 'zoneId', type: Zcl.DataType.UINT8}]}},
+            commandsResponse: Object.fromEntries([['appendZoneResponse', 5], ['updateZoneResponse', 7], ['removeZoneResponse', 9]].map(([name, ID]) =>
+                [name, {ID, name, parameters: [{name: 'errorCode', type: Zcl.DataType.ENUM8}]}])),
         }),
         m.deviceAddCustomCluster('aqaraFp400Radar', {
             name: 'aqaraFp400Radar',
@@ -1079,7 +1299,7 @@ export default {
         }),
         m.poll({key:'fp400_tracking_subscription',defaultIntervalSeconds:10,poll:fp400Poll}),
         m.deviceEndpoints({
-            multiEndpointSkip: [...zoneSettingKeys, 'maximum_detection_targets', ...Object.keys(configOptions), ...fp400AdditionalExposes.map(expose => expose.property), 'spatial_learning', 'detection_depth', 'presence_sensitivity', 'absence_timeout'],
+            multiEndpointSkip: [...nativeZoneExposes.map(expose => expose.property), ...zoneSettingKeys, 'maximum_detection_targets', ...Object.keys(configOptions), ...fp400AdditionalExposes.map(expose => expose.property), 'spatial_learning', 'detection_depth', 'presence_sensitivity', 'absence_timeout'],
             endpoints: Object.fromEntries(Array.from({length: 10}, (_, i) => [String(i + 1), i + 1])),
         }),
         m.occupancy({endpointNames: ['1']}),
