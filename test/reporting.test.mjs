@@ -61,6 +61,16 @@ test('native zones come before the light, and those that find no entry are polle
     assert.deepEqual(device.meta.fp400Reporting.reported, [3, 4, 5, 6]);
     assert.deepEqual(await polled(device), [2, 7]);
 });
+test('reporting is reallocated as zones grow from 0 to 4 to 8 and shrink to 2',async()=>{
+    const zones=[],device=fakeSensor({zones});
+    await configure(device);assert.ok(device.table.has('2/msIlluminanceMeasurement'));
+    zones.push(4,2,1,3);await configure(device);
+    assert.deepEqual(device.meta.fp400Reporting.reported,[3,4,5,6],'all four zones displace the old light entry in ID order');
+    zones.push(8,6,7,5);await configure(device);assert.deepEqual(device.meta.fp400Reporting.reported,[3,4,5,6]);
+    zones.splice(0,zones.length,8,1);await configure(device);
+    assert.deepEqual(device.meta.fp400Reporting.reported,[3,10,2]);
+    assert.equal(device.table.size,4);assert.ok(device.table.has('1/msOccupancySensing'));
+});
 
 test('entries of zone slots the sensor does not use go to the light', async () => {
     const device = fakeSensor({zones: [1, 2]});

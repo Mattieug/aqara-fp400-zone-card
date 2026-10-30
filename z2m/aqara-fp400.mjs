@@ -1284,12 +1284,19 @@ async function configureNativeReporting(device, coordinatorEndpoint, endpoints) 
     if (endpoints === undefined) {
         try {endpoints = await readNativeZoneMap(device);} catch {endpoints = null;}
     }
+    if (endpoints) endpoints = new Map([...endpoints].sort(([a],[b])=>a-b));
     const zones = endpoints ? [...endpoints.keys()] : null;
     const occupancy = max => [{attribute: 'occupancy', minimumReportInterval: 0, maximumReportInterval: max, reportableChange: 0}];
     // Converter 0.4 and older reported endpoints 3-6. A maximum interval of 0xFFFF stops a report and frees its entry.
-    const unused = endpoints ? zoneSlots.filter(({endpoint}) => ![...endpoints.values()].includes(endpoint)) : [];
-    for (const {endpoint} of unused) {
+    const wanted = new Set(endpoints ? [...endpoints.values()].slice(0,4) : []);
+    const managed = new Set([...zoneSlots.map(slot=>slot.endpoint),...(device.meta.fp400Reporting?.reported??[]).filter(id=>id!==2)]);
+    const unused = endpoints ? [...managed].filter(endpoint=>!wanted.has(endpoint)) : [];
+    for (const endpoint of unused) {
         try {await device.getEndpoint(endpoint).configureReporting('msOccupancySensing', occupancy(0xffff));} catch {}
+    }
+    if (endpoints && endpoints.size>=4) {
+        try {await device.getEndpoint(2).configureReporting('msIlluminanceMeasurement', [{attribute:'measuredValue',minimumReportInterval:10,maximumReportInterval:0xffff,reportableChange:5}]);}
+        catch { /* if the old entry cannot be freed, unsuccessful zone reports still fall back to polling */ }
     }
     const reported = [];
     const report = async (id, cluster, items) => {
@@ -1306,7 +1313,7 @@ async function configureNativeReporting(device, coordinatorEndpoint, endpoints) 
     }
     await report(2, 'msIlluminanceMeasurement', [{attribute: 'measuredValue', minimumReportInterval: 10, maximumReportInterval: 3600, reportableChange: 5}]);
     device.meta.fp400Reporting = {reported, zones};
-    device.save();
+    await device.save();
 }
 export const fp400ReportingSlots = {
     isModernExtend: true,
