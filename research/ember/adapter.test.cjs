@@ -158,4 +158,3 @@ test('the 4096-byte bound accepts its exact limit and refuses one extra byte',()
   if(length===4096)assert.equal(a.delivered[0].data.length,4096);
  }
 });
-

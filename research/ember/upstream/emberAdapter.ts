@@ -2287,4 +2287,3 @@ export class EmberAdapter extends Adapter {
         }
     }
 }
-

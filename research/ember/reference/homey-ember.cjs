@@ -532,4 +532,3 @@ module.exports = {
   setLogger,
   statusName,
 };
-

@@ -165,4 +165,3 @@
          clearInterval(this.watchdogCountersHandle);
          await this.ezsp.stop();
          this.ezsp.removeAllListeners();
-
