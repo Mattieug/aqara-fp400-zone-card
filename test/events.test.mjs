@@ -1,6 +1,6 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import definition, {decodeMotionEvent, parseSoftwareZone} from '../z2m/aqara-fp400.mjs';
+import definition, {decodeMotionEvent, parseSoftwareZone, readNativeZoneMap} from '../z2m/aqara-fp400.mjs';
 
 const hex = h => Buffer.from(h, 'hex');
 const desk = parseSoftwareZone({name: 'Desk', x_min: -140, x_max: 60, y_min: 8, y_max: 158, absence_timeout: 3});
@@ -23,6 +23,18 @@ test('only the main endpoint fires actions; movement frames are kept for diagnos
     assert.deepEqual(motion.convert({}, {endpoint: {ID: 1}, data: hex('1c5f11078b000001')}), {motion_last_frame: '1c5f11078b000001', action: 'leave'});
     assert.deepEqual(motion.convert({}, {endpoint: {ID: 3}, data: hex('1c5f11078b000001')}), {motion_last_frame: '1c5f11078b000001'});
     assert.equal(motion.convert({}, {endpoint: {ID: 1}, data: hex('1c5f11070a000000')}), undefined);
+});
+test('experimental raw child events use the confirmed mapping, never endpoint arithmetic or room actions',async()=>{
+    const motion=definition.fromZigbee.find(c=>c.cluster==='aqaraFp400Radar'&&c.type.includes('raw'));
+    const device={ieeeAddr:'raw-zone-events',meta:{},getEndpoint:ID=>({ID,read:async(cluster,[attr])=>attr===0?{0:[9]}:{1:3}})};
+    const msg={device,endpoint:{ID:9},data:hex('1c5f11078b000001')},opts={native_zones:true,experimental_features:true};
+    assert.equal(motion.convert({},msg,undefined,opts).native_zone_3_event_raw,undefined);
+    await readNativeZoneMap(device);
+    const state=motion.convert({},msg,undefined,opts);
+    assert.deepEqual(JSON.parse(state.native_zone_3_event_raw),{endpoint:9,event_id:0,hex:msg.data.toString('hex')});
+    assert.equal(state.action,undefined);assert.equal(state.native_zone_7_event_raw,undefined);
+    assert.equal(motion.convert({},msg,undefined,{native_zones:true}).native_zone_3_event_raw,undefined);
+    await definition.onEvent({type:'stop',data:{ieeeAddr:device.ieeeAddr}});
 });
 test('remove_target sends the command once per request and reports a refusal', async () => {
     const control = definition.toZigbee.find(c => c.key.includes('remove_target'));

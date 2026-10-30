@@ -8,6 +8,7 @@ import {logger} from 'zigbee-herdsman-converters/lib/logger';
 const e = exposes.presets;
 const ea = exposes.access;
 const NS = 'zhc:fp400';
+export const CONVERTER_VERSION = '0.6.0-dev.1';
 // Vendor attributes confirmed by direct reads from this FP400.
 const aqaraHumanCount = {
     cluster: 'aqaraFp400Radar',
@@ -460,16 +461,24 @@ const fp400AreaControl = {
     },
 };
 async function refreshFp400Configuration(endpoint) {
+    const areas = {};
     for (const attributes of [Object.values(configOptions).map(option => option.id), [4, 5, 6, 7, 8, 22], [16, 17], [18], [19], [20]]) {
-        await endpoint.read(configCluster, attributes, manufacturerOptions);
+        const data = await endpoint.read(configCluster, attributes, manufacturerOptions);
+        if (attributes.length === 1 && areaOf(attributes[0])) {
+            areas[`${areaOf(attributes[0])}_mask_hex`] = regionBuffer(data[attributes[0]]).toString('hex');
+        }
     }
+    return areas;
 }
 const fp400Refresh = {
     key: ['refresh_configuration'],
     convertSet: async (entity, key, value, meta) => {
         if (value !== 'refresh') throw new Error('Select refresh');
-        await refreshFp400Configuration(meta.device.getEndpoint(1));
+        const areas = await refreshFp400Configuration(meta.device.getEndpoint(1));
+        const state = {...areas, areas_read_time: new Date().toISOString()};
+        meta.publish?.(state);
         await refreshZoneSettings(meta.device);
+        return {state};
     },
 };
 const fp400LearningResult = {
@@ -485,6 +494,7 @@ const fp400LearningResult = {
     },
 };
 const fp400AdditionalExposes = [
+    e.text('converter_version',ea.STATE).withCategory('diagnostic').withHomeAssistant({enabledByDefault:false}).withDescription('Version of this experimental external converter'),
     e.numeric('installation_height', ea.ALL).withUnit('mm').withValueMin(0).withValueMax(65535).withValueStep(1).withCategory('config')
         .withDescription('Actual mounting height in millimetres. 0 means unconfigured; enter a positive measured height. Experimental Zigbee mapping.'),
     e.numeric('installation_height_min', ea.STATE_GET).withUnit('mm').withCategory('diagnostic').withDescription('Device-reported minimum mounting height; 0 means no usable limit reported'),
@@ -499,6 +509,7 @@ const fp400AdditionalExposes = [
     e.numeric('learning_result_code', ea.STATE).withCategory('diagnostic').withDescription('Raw event 3 result: 0 is consistent with success in the community reference; interpretation remains provisional'),
     e.text('learning_started_time', ea.STATE).withCategory('diagnostic').withDescription('UTC time of the last learning command accepted during this converter installation'),
     e.text('learning_result_time', ea.STATE).withCategory('diagnostic').withDescription('UTC time of the last received learning result event'),
+    e.text('areas_read_time', ea.STATE).withCategory('diagnostic').withHomeAssistant({enabledByDefault:false}).withDescription('UTC time after all three area masks were read and validated; does not certify a learning result'),
     e.enum('refresh_configuration', ea.SET, ['refresh']).withCategory('config').withDescription('Read mounting, AI, regions and native zone configuration from the sensor'),
     ...Object.entries({
         interference: 'Interference area: the sensor ignores movement in these cells (fan, curtain, TV).',
@@ -917,6 +928,7 @@ const nativeZoneExposes = Array.from({length: 8}, (_, i) => {
         e.text(`${key}_error`, ea.STATE).withCategory('diagnostic'),
         e.enum(`${key}_reporting`,ea.STATE,['reported','polled','unknown']).withCategory('diagnostic').withHomeAssistant({enabledByDefault:false}),
         e.enum(`${key}_source`,ea.STATE,['observed','cached','acknowledged','unknown']).withCategory('diagnostic').withHomeAssistant({enabledByDefault:false}),
+        e.text(`${key}_event_raw`,ea.STATE).withCategory('diagnostic').withHomeAssistant({enabledByDefault:false}).withDescription('Experimental raw movement event mapped by the actual endpoint catalogue; no interpreted zone activity'),
         e.binary(`${key}_owned`,ea.STATE,true,false).withCategory('diagnostic').withDescription('Whether editing this geometry is already authorized; false requires explicit takeover'),
         e.binary(`${key}_occupancy`, ea.STATE, true, false).withDescription('Presence reported by this native sensor zone; independent of software zones'),
         e.numeric(`${key}_count`, ea.STATE).withDescription('People reported by this native sensor zone')];
@@ -1224,7 +1236,7 @@ const softwareZoneHeartbeat={
     convert:(model,msg,publish,options)=>{
         if(msg.endpoint.ID!==1)return;
         const native = nativeContext(msg.device); native.enabled = options?.native_zones === true; native.publish = publish;
-        return {...nativeZoneState(msg.device), ...zoneState(softwareContext(msg.device,publish)), map_rotation:msg.device.meta.fp400MapRotation ?? 0,
+        return {converter_version:CONVERTER_VERSION,...nativeZoneState(msg.device), ...zoneState(softwareContext(msg.device,publish)), map_rotation:msg.device.meta.fp400MapRotation ?? 0,
             forget_still_targets:msg.device.meta.fp400ForgetStill ?? 0};
     },
 };
@@ -1307,10 +1319,15 @@ export function decodeMotionEvent(data) {
 }
 const fp400Motion = {
     cluster: 'aqaraFp400Radar', type: ['raw'],
-    convert: (model, msg) => {
+    convert: (model, msg, publish, options) => {
         if (!Buffer.isBuffer(msg.data) || msg.data[4] !== 0x8b) return;
         const action = decodeMotionEvent(msg.data);
-        return {motion_last_frame: msg.data.toString('hex').slice(0, 80), ...(action && msg.endpoint.ID === 1 ? {action} : {})};
+        const state = {motion_last_frame: msg.data.toString('hex').slice(0, 80), ...(action && msg.endpoint.ID === 1 ? {action} : {})};
+        if(msg.endpoint.ID!==1&&msg.device&&options?.native_zones===true&&options.experimental_features===true&&msg.data.length>=8&&[0x0c,0x1c].includes(msg.data[0])&&msg.data.readUInt16LE(1)===0x115f){
+            const context=nativeContext(msg.device),id=[...(context.endpoints??[])].find(([,endpoint])=>endpoint===msg.endpoint.ID)?.[0];
+            if(!context.dirty&&id>=1&&id<=8)state[`native_zone_${id}_event_raw`]=JSON.stringify({endpoint:msg.endpoint.ID,event_id:msg.data.readUInt16LE(5),hex:msg.data.toString('hex').slice(0,240)});
+        }
+        return state;
     },
 };
 // FC0C command 1: the sensor drops one track, e.g. a ghost. A real person is simply picked up again.

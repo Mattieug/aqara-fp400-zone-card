@@ -1,5 +1,5 @@
 /* Aqara FP400 zone card for Home Assistant + Zigbee2MQTT. https://github.com/bobtekkk/aqara-fp400-zone-card (MIT License) */
-const VERSION = '0.5.0';
+const VERSION = '0.6.0-dev.1';
 const COLORS = ['#67e4b8','#9fa9ff','#f9bf73','#f28fad','#68cce8','#d6a0ef','#bddb79','#ff9d7a'];
 const LIMITS = {x_min:-400,x_max:400,y_min:-50,y_max:1000};
 // The sensor's own area masks, in sidebar order. The map draws them in reverse, so ignore spots end up on top.
@@ -352,7 +352,7 @@ export class FP400ZoneCard extends (globalThis.HTMLElement ?? class {}) {
         for(let i=1;i<=8;i++)keys.push(['text',`software_zone_${i}_config`],['binary_sensor',`software_zone_${i}_occupancy`],['binary_sensor',`software_zone_${i}_available`],['sensor',`software_zone_${i}_count`],['sensor',`software_zone_${i}_activity`]);
         for(let i=1;i<=8;i++)keys.push(['text',`native_zone_${i}_config`],['sensor',`native_zone_${i}_status`],['sensor',`native_zone_${i}_error`],['binary_sensor',`native_zone_${i}_occupancy`],['sensor',`native_zone_${i}_count`],['number',`zone_${i}_absence_timeout`],['select',`zone_${i}_sensitivity`],['sensor',`native_zone_${i}_reporting`],['sensor',`native_zone_${i}_source`],['binary_sensor',`native_zone_${i}_owned`]);
         for(const [,items] of SETTINGS)for(const [domain,key] of items)keys.push([domain,key]);
-        keys.push(['sensor','learning_state'],['sensor','learning_result_code']);
+        keys.push(['sensor','learning_state'],['sensor','learning_result_code'],['sensor','areas_read_time']);
         return keys.map(([domain,key])=>this.entity(domain,key));
     }
     get hass(){return this._hass;}
@@ -388,7 +388,7 @@ export class FP400ZoneCard extends (globalThis.HTMLElement ?? class {}) {
                 try{data=JSON.parse(message.payload);}catch{return;}
                 if(!data||typeof data!=='object'||Array.isArray(data))return;
                 const keys=['targets_xy','tracking_targets','tracking_last_update','tracking_status',
-                    'interference_mask_hex','entry_exit_mask_hex','edge_mask_hex','learning_result_time','learning_state','learning_result_code','native_catalogue_status','native_catalogue_error',...Array.from({length:8},(_,i)=>['reporting','source'].map(k=>`native_zone_${i+1}_${k}`)).flat()]
+                    'interference_mask_hex','entry_exit_mask_hex','edge_mask_hex','learning_result_time','learning_state','learning_result_code','areas_read_time','converter_version','native_catalogue_status','native_catalogue_error',...Array.from({length:8},(_,i)=>['reporting','source'].map(k=>`native_zone_${i+1}_${k}`)).flat()]
                     .filter(key=>Object.hasOwn(data,key));
                 if(!keys.length)return;
                 const next={...this.liveTracking};let editorChanged=false,positionsChanged=false;
@@ -445,7 +445,7 @@ export class FP400ZoneCard extends (globalThis.HTMLElement ?? class {}) {
         for(const key of Object.keys(configuration.settings)){const zone=/^zone_([1-8])_/.exec(key);if(zone&&!configuration.native_zones[zone[1]]){delete configuration.settings[key];unavailable.push(key);}}
         return {configuration,unavailable};
     }
-    configurationBackup(){return {format:'aqara-fp400',version:1,card_version:VERSION,created_at:new Date().toISOString(),device:this.fp?.ieee??this.device,...this.configurationSnapshot()};}
+    configurationBackup(){return {format:'aqara-fp400',version:1,card_version:VERSION,converter_version:this.trackingValue('converter_version')??null,firmware_version:this._hass?.devices?.[this.fp?.deviceId]?.sw_version??null,created_at:new Date().toISOString(),device:this.fp?.ieee??this.device,...this.configurationSnapshot()};}
     downloadBackup(){
         const url=URL.createObjectURL(new Blob([JSON.stringify(this.configurationBackup(),null,2)],{type:'application/json'})),link=document.createElement('a');
         link.href=url;link.download=`fp400-${new Date().toISOString().slice(0,10)}.json`;link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
@@ -971,13 +971,27 @@ export class FP400ZoneCard extends (globalThis.HTMLElement ?? class {}) {
         if(code==null||code===''||!Number.isInteger(Number(code))||Number(code)<0||Number(code)>255)return false;
         clearTimeout(this.learnResultTimer);this.learnBefore=undefined;
         this.notice(`Room learning result received (code ${Number(code)}). The code's meaning has not been verified.`);
+        const areas=this.learnAreasBefore;this.learnAreasBefore=undefined;
+        if(areas)void this.readLearningAreas(Number(code),areas);
         return true;
+    }
+    async readLearningAreas(code,before){
+        const device=this.device,previous=this.trackingValue('areas_read_time'),prefix=`Room learning result received (code ${code}).`;
+        try{
+            await this._hass.callService('button','press',{entity_id:this.entity('button','refresh_configuration')});
+            await this.waitUntil(()=>{const now=this.trackingValue('areas_read_time');return typeof now==='string'&&now!==previous&&Number.isFinite(Date.parse(now))&&Object.keys(AREAS).every(type=>maskBits(this.areaMask(type))!==null);},'Area readback was not confirmed.');
+            if(device!==this.device)return;
+            const changes=Object.keys(AREAS).map(type=>{const old=maskBits(before[type]),now=maskBits(this.areaMask(type));return old?`${type}: +${[...now].filter(i=>!old.has(i)).length}/−${[...old].filter(i=>!now.has(i)).length} cells`:`${type}: ${now.size} cells (previous value unavailable)`;});
+            this.notice(`${prefix} Areas read: ${changes.join('; ')}. The result code's meaning remains unverified.`);
+        }catch(error){if(device===this.device)this.notice(`${prefix} ${error.message} The previous areas are retained.`, 'error');}
     }
     async learn(){
         if(this.learnBefore!==undefined)return;
+        if(this.saving||this.dirty?.size||this.pendingAreas?.length||this.pendingClears?.size){this.notice('Save or discard edits before learning the room.','error');return;}
         clearTimeout(this.learnTimer);
         if(!this.learnArmed){this.learnArmed=true;this.learnTimer=setTimeout(()=>{this.learnArmed=false;this.renderSettings();},8000);this.notice('Leave the room empty, then press again. Wait for a result from the sensor.');this.renderSettings();return;}
         this.learnArmed=false;this.renderSettings();
+        this.learnAreasBefore=this.available('button','refresh_configuration')?Object.fromEntries(Object.keys(AREAS).map(type=>[type,this.areaMask(type)])):null;
         this.learnBefore=this.trackingValue('learning_result_time')??'';
         try{
             await this._hass.callService('button','press',{entity_id:this.entity('button','spatial_learning')});

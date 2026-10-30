@@ -481,6 +481,8 @@ const scenarios = {
         check('X7 clearing the old result does not finish learning',await page.evaluate(()=>document.querySelector('fp400-zone-card').learnBefore!==undefined),await st(page));
         await waitMessage(page, /Room learning result received \(code 0\)/, 8000);
         check('X7 the second press starts learning and the card reports the result', (await calls(page)).at(-1).service === 'press', await calls(page));
+        await waitMessage(page,/Areas read:/,8000);
+        check('X7a learning rereads the masks without declaring success',!/successful|finished/i.test((await st(page)).message));
         await setting(page, 'forget_still_targets').fill('15'); await setting(page, 'forget_still_targets').press('Enter');
         await waitMessage(page, /Saved: Forget still dots after/);
         const forget = (await calls(page)).at(-1);
