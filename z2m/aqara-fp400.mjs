@@ -462,7 +462,7 @@ const fp400AdditionalExposes = [
     e.enum('learning_state', ea.STATE, ['accepted', 'result_received']).withCategory('diagnostic').withDescription('Accepted means only command acknowledgement; result_received means event 3 was received'),
     e.numeric('learning_result_code', ea.STATE).withCategory('diagnostic').withDescription('Raw event 3 result: 0 is consistent with success in the community reference; interpretation remains provisional'),
     e.text('learning_started_time', ea.STATE).withCategory('diagnostic').withDescription('UTC time of the last learning command accepted during this converter installation'),
-    e.text('learning_result_time', ea.STATE).withCategory('diagnostic').withHomeAssistant({enabledByDefault:false}).withDescription('UTC time of the last received learning result event'),
+    e.text('learning_result_time', ea.STATE).withCategory('diagnostic').withDescription('UTC time of the last received learning result event'),
     e.enum('refresh_configuration', ea.SET, ['refresh']).withCategory('config').withDescription('Read mounting, AI, regions and native zone configuration from the sensor'),
     ...Object.entries({
         interference: 'Interference area: the sensor ignores movement in these cells (fan, curtain, TV).',
@@ -474,7 +474,7 @@ const fp400AdditionalExposes = [
         e.text(`${area}_zone_remove`, ea.SET).withCategory('config')
             .withDescription(`${purpose} Removes the cells inside a rectangle or shape (same JSON).`),
         e.text(`${area}_clear`, ea.SET).withCategory('config').withDescription(`${purpose} Send 'confirm' to clear every cell.`),
-        e.text(`${area}_mask_hex`, ea.STATE_GET).withCategory('diagnostic').withHomeAssistant({enabledByDefault:false})
+        e.text(`${area}_mask_hex`, ea.STATE_GET).withCategory('diagnostic')
             .withDescription('Raw cell mask, 80 hex characters (20 rows × 16 columns). Used by the zone card to draw the cells.'),
     ]),
     ...Object.keys(regionAttributes).flatMap(key => [
@@ -931,7 +931,7 @@ const fp400TrackingExposes = [
     e.numeric('forget_still_targets', ea.ALL).withUnit('min').withValueMin(0).withValueMax(240).withValueStep(1).withCategory('config')
         .withDescription('Make the sensor forget a target whose position has not changed for this many minutes, usually a ghost that keeps a zone occupied. A real person is picked up again. People asleep can lie this still for over an hour. 0 turns it off.'),
     e.text('motion_last_frame', ea.STATE).withCategory('diagnostic').withHomeAssistant({enabledByDefault:false}).withDescription('Latest raw FC0B movement event, hex'),
-    e.enum('tracking_status', ea.STATE, ['valid','partial','held','invalid','stale']).withCategory('diagnostic').withHomeAssistant({enabledByDefault:false})
+    e.enum('tracking_status', ea.STATE, ['valid','partial','held','invalid','stale']).withCategory('diagnostic')
         .withDescription('valid: fresh positions. partial: the coordinator cut the last report, missing targets kept where last seen. held: no new positions; zones follow the sensor\'s own presence. invalid: unreadable report. stale: no positions and no presence'),
     e.text('tracking_last_frame', ea.STATE).withCategory('diagnostic').withHomeAssistant({enabledByDefault:false}).withDescription('Latest FC0C position event, hex (first 120 bytes)'),
     e.text('tracking_last_update', ea.STATE).withCategory('diagnostic').withHomeAssistant({enabledByDefault:false}).withDescription('Time of last complete position report'),

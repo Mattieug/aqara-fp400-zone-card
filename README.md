@@ -85,13 +85,14 @@ mqtt_friendly_name: living_room_fp400 # optional topic override
 ## Live MQTT tracking and Recorder size
 
 The converter still publishes all FP400 position and configuration values to the
-normal Zigbee2MQTT MQTT device topic, but new Home Assistant installations disable
-these **dashboard-only entities by default**:
+normal Zigbee2MQTT MQTT device topic. On new Home Assistant installations, only
+four **high-volume tracking entities are disabled by default**:
+`targets_xy`, `tracking_last_update`, `tracking_last_frame` and `motion_last_frame`.
 
-- High-frequency: `targets_xy`, `tracking_last_update`, `tracking_last_frame`,
-  `motion_last_frame` and `tracking_status`.
-- Map/configuration readouts: `interference_mask_hex`, `entry_exit_mask_hex`,
-  `edge_mask_hex` and `learning_result_time`.
+The low-frequency diagnostics `tracking_status`, `interference_mask_hex`,
+`entry_exit_mask_hex`, `edge_mask_hex` and `learning_result_time` stay enabled.
+This keeps the Areas editor usable for non-admin users and makes the saved region
+masks available immediately when the card opens, without waiting for MQTT traffic.
 
 The zone card reads live coordinates, status, area masks and learning completion
 using Home Assistant's `mqtt/subscribe` WebSocket API, which **requires a Home
@@ -104,15 +105,13 @@ If Zigbee2MQTT uses an HA discovery name different from its MQTT friendly name,
 set `mqtt_friendly_name` explicitly in the card YAML. Use `mqtt_base_topic` if
 Zigbee2MQTT is configured with a custom MQTT base topic.
 
-**Non-admin dashboard users:** All ordinary zone automations and configuration
-entities continue to work, but live dots and area maps require manually enabling
-these entities under **Settings > Devices & services > Entities**:
-`targets_xy`, `tracking_last_update`, `tracking_status`,
-`interference_mask_hex`, `entry_exit_mask_hex`, `edge_mask_hex`, and
-`learning_result_time`. The card automatically falls back to their HA states and
-shows a visible message naming missing live-position entities instead of advising
-users to change the sensor mounting. Exclude any re-enabled high-frequency entities
-from Recorder if you want to keep history small.
+**Non-admin dashboard users:** Ordinary zone automations, configuration controls
+and the Areas editor continue to work with their enabled HA entities. To show
+live target dots, manually enable `targets_xy` and `tracking_last_update` under
+**Settings > Devices & services > Entities**. The card automatically falls back to
+these HA states and shows a visible message naming the missing live-position
+entities instead of suggesting a mounting problem. Exclude the two re-enabled
+high-frequency sensors from Recorder if you want to keep history small.
 
 Zone occupancy, zone count, movement/activity sensors, events and configuration
 controls remain enabled for use in automations. Configuration writes continue via
@@ -130,11 +129,6 @@ recorder:
       - sensor.*_tracking_last_update
       - sensor.*_tracking_last_frame
       - sensor.*_motion_last_frame
-      - sensor.*_tracking_status
-      - sensor.*_interference_mask_hex
-      - sensor.*_entry_exit_mask_hex
-      - sensor.*_edge_mask_hex
-      - sensor.*_learning_result_time
 ```
 
 Restart Home Assistant after changing Recorder configuration. Existing history is
