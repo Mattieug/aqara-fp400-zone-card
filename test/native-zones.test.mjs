@@ -283,9 +283,10 @@ test('startup registers clusters before refreshing, and map cache survives error
     await stop(device);
 });
 
-test('native option controls exactly 40 exposes, discovery and output, while all other entities remain', async () => {
+test('native option controls zone exposes, discovery and output, while all other entities remain', async () => {
     const device = sensor([[1, 7]]), normal = model.exposes(device, {}), enabled = model.exposes(device, {native_zones: true});
-    assert.equal(enabled.length - normal.length, 40);
+    assert.equal(enabled.filter(e=>/^native_zone_[1-8]_config$/.test(e.property)).length,8);
+    assert.equal(enabled.filter(e=>/^native_zone_[1-8]_reporting$/.test(e.property)&&e.homeassistant?.enabledByDefault===false).length,8);
     assert.deepEqual(enabled.filter(e => !e.property?.startsWith('native_zone_')), normal);
     assert.ok(!normal.some(e => e.property?.startsWith('native_zone_')));
     for (const method of ['convertGet', 'convertSet']) {

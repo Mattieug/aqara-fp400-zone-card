@@ -689,6 +689,7 @@ export function nativeZoneState(device) {
         state[`${key}_error`] = (record?.error || (!known && context.error) || '').slice(0, 255);
         state[`${key}_occupancy`] = known && exists ? context.readings[id]?.occupancy ?? null : null;
         state[`${key}_count`] = known && exists ? context.readings[id]?.count ?? null : null;
+        state[`${key}_reporting`] = !known || !exists || !device.meta.fp400Reporting ? 'unknown' : device.meta.fp400Reporting.reported.includes(context.endpoints.get(id)) ? 'reported' : 'polled';
     }
     return state;
 }
@@ -841,6 +842,7 @@ const nativeZoneExposes = Array.from({length: 8}, (_, i) => {
     return [e.text(`${key}_config`, ea.ALL).withCategory('config').withDescription('Sensor zone JSON: name and mask_hex (80 hex characters). clear removes it. Use overwrite:true to replace an unmanaged ID. Timeout uses the separate zone number setting.'),
         e.enum(`${key}_status`, ea.STATE, ['ready', 'pending', 'error']).withCategory('diagnostic'),
         e.text(`${key}_error`, ea.STATE).withCategory('diagnostic'),
+        e.enum(`${key}_reporting`,ea.STATE,['reported','polled','unknown']).withCategory('diagnostic').withHomeAssistant({enabledByDefault:false}),
         e.binary(`${key}_occupancy`, ea.STATE, true, false).withDescription('Presence reported by this native sensor zone; independent of software zones'),
         e.numeric(`${key}_count`, ea.STATE).withDescription('People reported by this native sensor zone')];
 }).flat();
@@ -1062,8 +1064,8 @@ function zoneState(context) {
 // Every 10 s: put back settings the sensor lost (when due) and keep the position stream alive while zones exist.
 // The sensor never reports its area masks on its own, so read them at start and every 5 minutes; the card then
 // also shows changes made elsewhere (e.g. AI recognition).
-const regionsReadAt=new Map();
-export async function fp400Poll(device) {
+const regionsReadAt=new Map(), trackingLease=new Map();
+export async function fp400Poll(device, options = {}) {
     await maintainNativeZones(device);
     // Room presence is only reported when it changes, so read it once for the zones to start from.
     if (softwareZoneContexts.get(device.ieeeAddr)?.tracker.presence===undefined) {
@@ -1082,7 +1084,7 @@ export async function fp400Poll(device) {
         if (restored.length) logger.info(`FP400 '${device.ieeeAddr}' lost settings (usually a power cut); put back: ${restored.join(', ')}`, NS);
     }
     await forgetStillTargets(device);
-    if (Object.keys(device.meta.fp400SoftwareZones ?? {}).length || device.meta.fp400ForgetStill) await subscribeTracking(device);
+    if ((options.tracking_mode==='always' || Object.keys(device.meta.fp400SoftwareZones ?? {}).length || device.meta.fp400ForgetStill) && Date.now()>=(trackingLease.get(device.ieeeAddr)??0)) await subscribeTracking(device);
     if (Date.now()-(regionsReadAt.get(device.ieeeAddr) ?? 0) < 300000) return;
     await withDeviceLock(device, async () => {
         for (const id of Object.values(regionAttributes)) {
@@ -1119,6 +1121,7 @@ async function subscribeTracking(device, seconds=120) {
     const result=await device.getEndpoint(1).command('aqaraFp400Location','subscribeLocationData',{timeout:seconds},
         {...manufacturerOptions,disableDefaultResponse:false,disableResponse:false});
     if (result?.statusCode!==0) throw new Error(`Tracking subscription not acknowledged: ${JSON.stringify(result)}`);
+    trackingLease.set(device.ieeeAddr,Date.now()+Math.max(0,seconds-30)*1000);
 }
 const softwareZoneControl={
     key:Array.from({length:8},(_,i)=>`software_zone_${i+1}_config`),
@@ -1339,7 +1342,7 @@ export async function fp400UnreportedPoll(device) {
         const context = nativeContext(device);
         const endpoints = context.enabled ? context.endpoints : null;
         // An unused or temporarily unavailable zone must not block the others.
-        for (const id of polledZoneEndpoints(device)) {
+        for (const id of context.enabled ? [] : polledZoneEndpoints(device)) {
             try {await device.getEndpoint(id).read('msOccupancySensing', ['occupancy']);} catch {}
         }
         for (const endpoint of endpoints?.values() ?? []) {
@@ -1347,6 +1350,23 @@ export async function fp400UnreportedPoll(device) {
         }
     });
     if (failure) throw failure;
+}
+export async function fp400NativePresencePoll(device, options = {}) {
+    if(options.native_zones!==true)return;
+    const interval=options.native_zone_poll_interval??60;
+    if(!Number.isInteger(interval)||interval<10||interval>300)throw new Error('native_zone_poll_interval must be 10..300 seconds');
+    await withDeviceLock(device,async()=>{
+        const context=nativeContext(device);context.enabled=true;
+        const endpoints=context.endpoints??await readNativeZoneMap(device);
+        for(const [id,ep] of endpoints){
+            if(id<1||id>8||device.meta.fp400Reporting?.reported.includes(ep))continue;
+            try{
+                const raw=(await device.getEndpoint(ep).read('msOccupancySensing',['occupancy'])).occupancy;
+                if(Number.isInteger(raw))(context.readings[id]??={}).occupancy=(raw&1)!==0;
+            }catch{/* no response cannot become absence */}
+        }
+        await publishNative(device);
+    });
 }
 
 export default {
@@ -1378,7 +1398,8 @@ export default {
         ...fp400RegionControl.key.map(key => ({...fp400RegionControl, key: [key]})),
         ...fp400RegionGet.key.map(key => ({...fp400RegionGet, key: [key]})),
         ...fp400AreaControl.key.map(key => ({...fp400AreaControl, key: [key]})), fp400Refresh, ...Object.keys(configOptions).map((key) => ({...serializedSetting(fp400ConfigControl), key: [key]})), fp400Learning, serializedSetting(fp400SensitivityControl), serializedSetting(fp400AbsenceControl), fp400DepthControl],
-    options: [e.binary('native_zones', ea.SET, true, false).withDescription('Enable native sensor zone editing and telemetry (default: false)')],
+    options: [e.binary('native_zones', ea.SET, true, false).withDescription('Enable native sensor zone editing and telemetry (default: false)'),
+        e.enum('tracking_mode',ea.SET,['auto','always']).withDescription('auto subscribes while software zones or still-target forgetting need it; always also keeps the map live with native-only zones (default: auto)')],
     exposes: (device, options = {}) => [...(options.native_zones === true ? nativeZoneExposes : []), ...softwareZoneExposes, ...fp400TrackingExposes,
         e.enum('restore_status',ea.STATE_GET,['pending','complete','error']).withCategory('diagnostic').withHomeAssistant({enabledByDefault:false})
             .withDescription('Configuration recovery: pending retries temporary failures; error identifies saved settings unsupported by the firmware'),
@@ -1404,7 +1425,7 @@ export default {
     // Tracking (re)starts from the 10 s poll below: on 'start' this hook runs before the custom clusters exist.
     onEvent: async(event)=>{
         // The sensor announces itself when power returns, with its areas and mounting forgotten.
-        if(event.type==='deviceAnnounce') {restoreChecked.delete(event.data.device.ieeeAddr);restoreProgress.delete(event.data.device.ieeeAddr);}
+        if(event.type==='deviceAnnounce') {restoreChecked.delete(event.data.device.ieeeAddr);restoreProgress.delete(event.data.device.ieeeAddr);trackingLease.delete(event.data.device.ieeeAddr);}
         if(event.type==='stop') {
             const context=softwareZoneContexts.get(event.data.ieeeAddr);
             if(context)clearInterval(context.timer);
@@ -1416,6 +1437,7 @@ export default {
             if (native) {native.stopped = true; native.publish = undefined;}
             nativeContexts.delete(event.data.ieeeAddr);
             restoreProgress.delete(event.data.ieeeAddr);persistencePending.delete(event.data.ieeeAddr);
+            trackingLease.delete(event.data.ieeeAddr);
         }
     },
     extend: [
@@ -1449,6 +1471,8 @@ export default {
         }),
         fp400NativeLifecycle,
         m.poll({key:'fp400_tracking_subscription',defaultIntervalSeconds:10,poll:fp400Poll}),
+        m.poll({key:'fp400_native_presence',optionKey:'native_zone_poll_interval',defaultIntervalSeconds:60,poll:fp400NativePresencePoll,
+            option:e.numeric('native_zone_poll_interval',ea.SET).withValueMin(10).withValueMax(300).withValueStep(1).withUnit('s').withDescription('Poll native occupancy without a reporting slot (default: 60). Counts and light keep their separate interval.')}),
         m.deviceEndpoints({
             multiEndpointSkip: [...nativeZoneExposes.map(expose => expose.property), ...zoneSettingKeys, 'maximum_detection_targets', ...Object.keys(configOptions), ...fp400AdditionalExposes.map(expose => expose.property), 'spatial_learning', 'detection_depth', 'presence_sensitivity', 'absence_timeout'],
             endpoints: Object.fromEntries(Array.from({length: 10}, (_, i) => [String(i + 1), i + 1])),
