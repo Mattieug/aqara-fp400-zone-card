@@ -1,6 +1,6 @@
 # FP400 native zones and reports
 
-The external converter supports `lumi.models.4447_8295`. Native zones are separate from the existing software zones: the FP400 computes native occupancy and people counts, while Zigbee2MQTT computes software zones from coordinates. Enable the `native_zones` device option in Zigbee2MQTT to expose the native editor's 40 entities; the option is off by default.
+The external converter supports `lumi.models.4447_8295`. Native zones are separate from the existing software zones: the FP400 computes native occupancy and people counts, while Zigbee2MQTT computes software zones from coordinates. Enable the `native_zones` device option in Zigbee2MQTT to expose the native editor and its configuration/diagnostic entities; the option is off by default.
 
 ## Native zone transport
 
@@ -12,7 +12,7 @@ All zone commands go to endpoint 1, cluster `0xFC0A`, manufacturer `0x115F`.
 | Update one zone | `0x06` | `0x07` |
 | Remove one zone | `0x08` | `0x09` |
 
-Append/Update carry a STRUCT with four typed members: zone ID (uint8), zone type (enum8, 0 for detection), a 40-byte OCTET_STR bitmap, and proximity enabled (boolean, true). The STRUCT parameter begins with its member count; there is no extra outer `0x4C` tag. A complete Append/Update ZCL frame is 55 bytes.
+Append/Update carry a STRUCT with four typed members: zone ID (uint8), zone type (enum8, 0 for detection), a 40-byte OCTET_STR bitmap, and a boolean whose physical meaning is not validated (new zones default to true; known values are preserved during takeover and later edits). The STRUCT parameter begins with its member count; there is no extra outer `0x4C` tag. A complete Append/Update ZCL frame is 55 bytes.
 
 The matching native response must contain `errorCode=0`. A generic Default Response SUCCESS is not the native command response. The converter uses herdsman's existing response matching and timeout, checks the returned error code, and confirms the endpoint map. A newly appended zone remains `pending` while the sensor initializes its endpoint. The existing 10-second poll completes it no earlier than 20 seconds after acknowledgement, restores any saved numeric timeout, reads it back, and only then publishes `ready`. This delay accommodates the delayed reset observed on firmware 20260724; there is no documented initialization-complete event. Existing-zone updates and removals do not need this creation delay.
 
@@ -28,17 +28,17 @@ The card manages IDs 1–8 one at a time. It does not clear the full catalogue. 
 
 Published configurations have three forms:
 
-- JSON: geometry last successfully written by this converter and saved in Zigbee2MQTT's device database.
+- JSON: acknowledged local geometry or a validated full-catalogue observation. Check the source and owned diagnostics before editing.
 - `clear`: no active hardware zone at this ID.
 - `unmanaged`: geometry is unknown or uncertain, including a previously saved zone that is now absent from the hardware map. The card asks for explicit confirmation before taking over such a slot.
 
 `native_zone_N_status` reports `pending`, `ready`, or `error`; `native_zone_N_error` carries the failure reason. A Home Assistant service return only acknowledges submission. The card waits for the converter's confirmed configuration and status.
 
-The converter saves an operation as pending before sending it. A failure after a command may leave the physical device changed; it does not automatically undo the command. A later attempt reads the current endpoint map again. An interrupted pending operation becomes a retryable error after restart. Uncertain geometry is not displayed as confirmed; keep an open draft to retry it. Native geometry is not automatically restored after a sensor reset or power loss.
+The converter saves an operation as pending before sending it. A failure after a command may leave the physical device changed; it does not automatically undo the command. A later attempt reads the current endpoint map again. An interrupted pending operation becomes a retryable error after restart. Uncertain geometry is not displayed as confirmed; keep an open draft to retry it. Native geometry is not restored by default. The development branch adds opt-in recovery only after two complete, consistent catalogue reads; see the development guide.
 
 Each command must fit Home Assistant MQTT Text's [255-character limit](https://www.home-assistant.io/integrations/text.mqtt/), including JSON escaping and the overwrite flag. Zone names are local labels; they are not part of the Zigbee payload.
 
-The geometry is a local record of acknowledged writes, not a fresh read of the sensor's full catalogue. Changes made by another controller to an existing ID's geometry cannot be detected from ChildEndpointList/ZoneID alone.
+By default, geometry remains a local record of acknowledged writes. With experimental_features, the full catalogue can supply observed geometry, detect changes and distinguish foreign zones. ChildEndpointList/ZoneID alone cannot detect geometry changes. Failed or truncated full reads preserve the cache and block automatic recovery. See [development behavior](experimental-development.md).
 
 ## Pairing capture (not applied by this converter)
 
@@ -80,4 +80,4 @@ These examples come from passive M3 captures on 22 October 2026. Malformed, trun
 
 This converter does not implement APS reassembly. Per-zone writes and the small ChildEndpointList/ZoneID reads avoid needing the full catalogue to edit known zones. Native occupancy/count reports are independent of coordinate tracking; the live positions and software zones retain their existing limitations.
 
-The wire fixtures and automated tests validate encoding, decoding, confirmation, and editor behavior. In the [maintainer's hardware test](https://github.com/bobtekkk/aqara-fp400-zone-card/pull/9#issuecomment-6518505017) on 30 October 2026, firmware 20260724 with Zigbee2MQTT 2.14.2 confirmed Append/Update/Remove responses, exact masks, endpoint discovery, reporting allocation, and the dashboard editor. The same test found that a new zone resets its timeout to 10 seconds within about 10 seconds of creation. The revised settling and timeout flow has a regression test for that sequence and still needs to be repeated on the physical sensor. Native-zone persistence across power cuts remains unconfirmed; this converter does not recreate lost native geometry.
+The wire fixtures and automated tests validate encoding, decoding, confirmation, and editor behavior. In the [maintainer's hardware test](https://github.com/bobtekkk/aqara-fp400-zone-card/pull/9#issuecomment-6518505017) on 30 October 2026, firmware 20260724 with Zigbee2MQTT 2.14.2 confirmed Append/Update/Remove responses, exact masks, endpoint discovery, reporting allocation, and the dashboard editor. The same test found that a new zone resets its timeout to 10 seconds within about 10 seconds of creation. The revised settling and timeout flow has a regression test for that sequence and still needs to be repeated on the physical sensor. Native-zone persistence across power cuts remains unconfirmed; opt-in recovery now has simulated coverage but no hardware validation in this contribution.

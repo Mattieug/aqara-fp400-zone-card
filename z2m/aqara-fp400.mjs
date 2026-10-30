@@ -8,6 +8,7 @@ import {logger} from 'zigbee-herdsman-converters/lib/logger';
 const e = exposes.presets;
 const ea = exposes.access;
 const NS = 'zhc:fp400';
+export const CONVERTER_VERSION = '0.6.0-dev.1';
 // Vendor attributes confirmed by direct reads from this FP400.
 const aqaraHumanCount = {
     cluster: 'aqaraFp400Radar',
@@ -22,6 +23,7 @@ const aqaraActivityState = {
     cluster: 'aqaraFp400Location',
     type: ['attributeReport', 'readResponse'],
     convert: (model, msg) => {
+        if (msg.endpoint.ID !== 1) return;
         const state = msg.data.activityState ?? msg.data[7];
         const values = ['unknown', 'active', 'still'];
         return Number.isInteger(state) && state >= 0 && state < values.length
@@ -56,7 +58,7 @@ function decodeConfig(data) {
 }
 const fp400ConfigReport = {
     cluster: configCluster, type: ['attributeReport', 'readResponse'],
-    convert: (model, msg) => decodeConfig(msg.data),
+    convert: (model, msg) => msg.endpoint.ID === 1 ? decodeConfig(msg.data) : undefined,
 };
 const fp400ConfigControl = {
     key: Object.keys(configOptions),
@@ -237,6 +239,8 @@ function withDeviceLock(device, task) {
     deviceLocks.set(device.ieeeAddr, run.catch(() => {}));
     return run;
 }
+const serializedSetting = control => ({...control, convertSet: (entity, key, value, meta) =>
+    withDeviceLock(meta.device, () => control.convertSet(entity, key, value, meta))});
 // The FP400 forgets its areas and mounting when it loses power (a Zigbee2MQTT restart keeps them), so every
 // setting written through this converter is kept with the device and put back when the sensor has lost it.
 // Settings made before this existed are taken over from the sensor at the first check.
@@ -260,7 +264,12 @@ function unsetValue(setting, value) {
 async function remember(device, setting, raw) {
     device.meta ??= {};
     device.meta.fp400Saved = {...device.meta.fp400Saved, [savedKey(setting)]: {...setting, value: savedValue(setting, raw)}};
-    try {await device.save?.();} catch { /* kept in memory; saved with the next change */ }
+    try {await device.save?.(); persistencePending.delete(device.ieeeAddr);}
+    catch (error) {
+        persistencePending.add(device.ieeeAddr);restoreChecked.delete(device.ieeeAddr);
+        updateRestoreProgress(device, {status:'pending', error:`Configuration backup: ${error.message}`, attempt:0, nextAt:Date.now()+10000});
+        throw error; // The sensor accepted it, but a durable backup was not confirmed.
+    }
 }
 async function readSetting(device, setting) {
     const data = await device.getEndpoint(setting.endpoint).read(setting.cluster, [setting.attribute], setting.manufacturer ? manufacturerOptions : {});
@@ -273,25 +282,36 @@ async function readSetting(device, setting) {
 export async function restoreSettings(device) {
     // Every FP400 has areas, so this read tells an offline sensor from a setting its firmware lacks.
     await device.getEndpoint(1).read(configCluster, [regionAttributes.interference_region], manufacturerOptions);
-    const saved = {...device.meta?.fp400Saved}, restored = [], failed = [];
+    const saved = {...device.meta?.fp400Saved}, restored = [], failed = [], unsupported = [];
+    // Only explicit ZCL statuses establish unsupported firmware, never a timeout or an empty reply.
+    const classify = (name, error) => {
+        if ([0x86,0xc3].includes(error?.code)) {if(savedKeyKnown(name))unsupported.push(name);}
+        else failed.push(`${name}: ${error?.message ?? error}`);
+    };
+    const savedKeyKnown = name => Object.values(saved).some(setting=>setting.name===name);
     let adopted = false;
     for (const setting of restorable) {
         if (saved[savedKey(setting)]) continue;
         try {
             const value = await readSetting(device, setting);
             if (!unsetValue(setting, value)) {saved[savedKey(setting)] = {...setting, value};adopted = true;}
-        } catch { /* not on this firmware */ }
+        } catch (error) {classify(setting.name,error);}
     }
     if (adopted) {
         device.meta ??= {};
         device.meta.fp400Saved = saved;
-        try {await device.save?.();} catch { /* taken over again at the next check */ }
+        persistencePending.add(device.ieeeAddr);
+    }
+    if (persistencePending.has(device.ieeeAddr)) {
+        try {await device.save?.();persistencePending.delete(device.ieeeAddr);}
+        catch (error) {failed.push(`Configuration backup: ${error.message}`);}
     }
     // Mounting first and areas last, in case a new mounting makes the sensor redo its areas.
     const order = setting => {const index = restorable.findIndex(known => savedKey(known) === savedKey(setting));return index < 0 ? restorable.length : index;};
     for (const setting of Object.values(saved).sort((a, b) => order(a) - order(b))) {
         try {
             const zone = /^zone_(\d+)_(?:sensitivity|absence_timeout)$/.exec(setting.name);
+            if (zone && nativeContext(device).endpoints!==null && !nativeContext(device).endpoints.has(Number(zone[1]))) continue;
             if (zone && (pendingNativeZone(device, Number(zone[1])) || (await device.getEndpoint(setting.endpoint).read('aqaraFp400Radar', [1], manufacturerOptions))[1] !== Number(zone[1]))) continue;
             const current = await readSetting(device, setting);
             if (current === setting.value || (isMask(setting) && (!emptyMask(current) || emptyMask(setting.value)))) continue;
@@ -299,14 +319,27 @@ export async function restoreSettings(device) {
             await device.getEndpoint(setting.endpoint).write(setting.cluster, {[setting.attribute]: {value, type: setting.type}}, setting.manufacturer ? manufacturerOptions : {});
             if (await readSetting(device, setting) !== setting.value) throw new Error('not confirmed');
             restored.push(setting.name);
-        } catch {failed.push(setting.name);}
+        } catch (error) {classify(setting.name,error);}
     }
     if (failed.length) logger.warning(`FP400 '${device.ieeeAddr}': could not check or put back ${failed.join(', ')}`, NS);
-    return restored;
+    return {restored, failed, unsupported};
 }
 // Checked after a Zigbee2MQTT start, after the sensor announces itself (it does when power returns),
 // and when the periodic area read finds a kept area wiped.
 const restoreChecked = new Set();
+const persistencePending = new Set(), restoreProgress = new Map();
+const restoreState = device => {
+    const progress=restoreProgress.get(device.ieeeAddr);
+    return {restore_status:progress?.status??'pending',restore_error:progress?.error??''};
+};
+function updateRestoreProgress(device, progress) {
+    restoreProgress.set(device.ieeeAddr,progress);
+    softwareZoneContexts.get(device.ieeeAddr)?.publish?.(restoreState(device));
+}
+const fp400RestoreDiagnostics = {
+    key:['restore_status','restore_error'],
+    convertGet:async(entity,key,meta)=>meta.publish(restoreState(meta.device)),
+};
 // Monitoring cells are stored as exclusions, so a clear bit means "selected".
 function regionState(key, value) {
     let set = 0;
@@ -428,16 +461,24 @@ const fp400AreaControl = {
     },
 };
 async function refreshFp400Configuration(endpoint) {
+    const areas = {};
     for (const attributes of [Object.values(configOptions).map(option => option.id), [4, 5, 6, 7, 8, 22], [16, 17], [18], [19], [20]]) {
-        await endpoint.read(configCluster, attributes, manufacturerOptions);
+        const data = await endpoint.read(configCluster, attributes, manufacturerOptions);
+        if (attributes.length === 1 && areaOf(attributes[0])) {
+            areas[`${areaOf(attributes[0])}_mask_hex`] = regionBuffer(data[attributes[0]]).toString('hex');
+        }
     }
+    return areas;
 }
 const fp400Refresh = {
     key: ['refresh_configuration'],
     convertSet: async (entity, key, value, meta) => {
         if (value !== 'refresh') throw new Error('Select refresh');
-        await refreshFp400Configuration(meta.device.getEndpoint(1));
+        const areas = await refreshFp400Configuration(meta.device.getEndpoint(1));
+        const state = {...areas, areas_read_time: new Date().toISOString()};
+        meta.publish?.(state);
         await refreshZoneSettings(meta.device);
+        return {state};
     },
 };
 const fp400LearningResult = {
@@ -453,6 +494,7 @@ const fp400LearningResult = {
     },
 };
 const fp400AdditionalExposes = [
+    e.text('converter_version',ea.STATE).withCategory('diagnostic').withHomeAssistant({enabledByDefault:false}).withDescription('Version of this experimental external converter'),
     e.numeric('installation_height', ea.ALL).withUnit('mm').withValueMin(0).withValueMax(65535).withValueStep(1).withCategory('config')
         .withDescription('Actual mounting height in millimetres. 0 means unconfigured; enter a positive measured height. Experimental Zigbee mapping.'),
     e.numeric('installation_height_min', ea.STATE_GET).withUnit('mm').withCategory('diagnostic').withDescription('Device-reported minimum mounting height; 0 means no usable limit reported'),
@@ -467,6 +509,7 @@ const fp400AdditionalExposes = [
     e.numeric('learning_result_code', ea.STATE).withCategory('diagnostic').withDescription('Raw event 3 result: 0 is consistent with success in the community reference; interpretation remains provisional'),
     e.text('learning_started_time', ea.STATE).withCategory('diagnostic').withDescription('UTC time of the last learning command accepted during this converter installation'),
     e.text('learning_result_time', ea.STATE).withCategory('diagnostic').withDescription('UTC time of the last received learning result event'),
+    e.text('areas_read_time', ea.STATE).withCategory('diagnostic').withHomeAssistant({enabledByDefault:false}).withDescription('UTC time after all three area masks were read and validated; does not certify a learning result'),
     e.enum('refresh_configuration', ea.SET, ['refresh']).withCategory('config').withDescription('Read mounting, AI, regions and native zone configuration from the sensor'),
     ...Object.entries({
         interference: 'Interference area: the sensor ignores movement in these cells (fan, curtain, TV).',
@@ -595,7 +638,12 @@ const fp400ZoneExposes = [
 const nativeContexts = new Map();
 function nativeContext(device) {
     let context = nativeContexts.get(device.ieeeAddr);
-    if (!context) {context = {endpoints: null, readings: {}, error: '', dirty: true, enabled: false}; nativeContexts.set(device.ieeeAddr, context);}
+    if (!context) {
+        let catalogue=null;
+        try{catalogue=parseNativeCatalogue(Object.values(device.meta?.fp400NativeObserved?.zones??{}).map(z=>[z.id,z.type,Buffer.from(z.mask_hex,'hex'),z.flag]));}catch{/* invalid local cache is not authoritative */}
+        context = {endpoints: null, readings: {}, error: '', dirty: true, enabled: false,catalogue,catalogueVerified:false,options:{}};
+        nativeContexts.set(device.ieeeAddr, context);
+    }
     return context;
 }
 function reportedZoneId(device, endpoint) {
@@ -608,7 +656,7 @@ function reportedZoneId(device, endpoint) {
 function nativeRequest(meta) {
     if (meta.options?.native_zones !== true) throw new Error('Enable the native_zones device option first');
     const context = nativeContext(meta.device);
-    context.enabled = true; context.publish = meta.publish;
+    context.enabled = true; context.publish = meta.publish;context.options=meta.options;
     return context;
 }
 export function parseNativeZone(value) {
@@ -645,6 +693,48 @@ export async function readNativeZoneMap(device) {
         throw error;
     }
 }
+// The full catalogue can exceed an Ember frame. Accept only complete typed records and
+// cross-check every ID against two complete endpoint maps before adopting any geometry.
+export function parseNativeCatalogue(value){
+    if(!Array.isArray(value)||value.length>8)throw new Error('Native catalogue is incomplete or unsupported');
+    const zones=new Map();
+    for(const record of value){
+        if(!Array.isArray(record)||record.length!==4)throw new Error('Native catalogue record is incomplete');
+        const typed=record.every(v=>v&&typeof v==='object'&&Object.hasOwn(v,'elmVal'));
+        if(typed&&record.some((v,i)=>v.elmType!==[0x20,0x30,0x41,0x10][i]))throw new Error('Unsupported native catalogue member type');
+        const [id,type,raw,flag]=record.map(v=>typed?v.elmVal:v),mask=regionBuffer(raw);
+        if(!Number.isInteger(id)||id<0||id>255||zones.has(id)||type!==0||![0,1,false,true].includes(flag)||!mask.some(Boolean))throw new Error('Invalid native catalogue record');
+        zones.set(id,{id,type,mask_hex:mask.toString('hex'),flag:Number(flag)});
+    }
+    return zones;
+}
+async function readNativeCatalogueUnlocked(device){
+    const context=nativeContext(device);
+    try{
+        const before=await readNativeZoneMap(device);
+        const data=await device.getEndpoint(1).read(configCluster,[16],manufacturerOptions);
+        const catalogue=parseNativeCatalogue(data[16]);
+        const after=await readNativeZoneMap(device);
+        if(before.size!==catalogue.size||[...before].some(([id,ep])=>!catalogue.has(id)||after.get(id)!==ep)||after.size!==before.size)throw new Error('Catalogue and endpoint maps disagree; retaining last complete geometry');
+        const zones=Object.fromEntries(catalogue),signature=JSON.stringify([...catalogue].sort(([a],[b])=>a-b)),now=Date.now();
+        const previous=device.meta.fp400NativeObserved;
+        if(JSON.stringify(previous?.zones)!==JSON.stringify(zones)){
+            device.meta.fp400NativeObserved={zones};
+            try{await device.save();}catch(error){device.meta.fp400NativeObserved=previous;throw error;}
+        }
+        const observation=context.catalogueObservation;
+        context.catalogueObservation=observation?.signature===signature
+            ? now-observation.at>=10000?{signature,at:now,count:observation.count+1}:observation
+            :{signature,at:now,count:1};
+        context.catalogue=catalogue;context.catalogueVerified=true;context.catalogueError='';context.catalogueAt=now;
+        return catalogue;
+    }catch(error){context.catalogueVerified=false;context.catalogueError=error.message;context.catalogueObservation=null;context.catalogueAt=Date.now();throw error;}
+}
+export const readNativeCatalogue=device=>withDeviceLock(device,()=>readNativeCatalogueUnlocked(device));
+function nativeOwned(device,id){
+    const record=device.meta?.fp400NativeZones?.[id],observed=nativeContext(device).catalogue?.get(id);
+    return Boolean(record?.config&&(!observed||record.config.mask_hex===observed.mask_hex));
+}
 export function nativeZoneState(device) {
     const context = nativeContext(device), state = {};
     if (!context.enabled) return state;
@@ -658,7 +748,15 @@ export function nativeZoneState(device) {
         state[`${key}_error`] = (record?.error || (!known && context.error) || '').slice(0, 255);
         state[`${key}_occupancy`] = known && exists ? context.readings[id]?.occupancy ?? null : null;
         state[`${key}_count`] = known && exists ? context.readings[id]?.count ?? null : null;
+        state[`${key}_reporting`] = !known || !exists || !device.meta.fp400Reporting ? 'unknown' : device.meta.fp400Reporting.reported.includes(context.endpoints.get(id)) ? 'reported' : 'polled';
+        const observed=context.options.experimental_features===true?context.catalogue?.get(id):null;
+        const uncertain=record&&record.status!=='ready';
+        state[`${key}_source`]=observed?context.catalogueVerified?'observed':'cached':confirmed?'acknowledged':'unknown';
+        state[`${key}_owned`]=nativeOwned(device,id);
+        if(observed&&known&&exists&&!uncertain)state[`${key}_config`]=JSON.stringify({name:config?.name??`Zone ${id}`,mask_hex:observed.mask_hex});
     }
+    state.native_catalogue_status=context.catalogueVerified?'observed':context.catalogueError?'uncertain':'unread';
+    state.native_catalogue_error=context.catalogueError??'';
     return state;
 }
 const fp400NativeReport = {
@@ -715,11 +813,13 @@ async function finishNativeZone(device, id, endpoints) {
             if (!Number.isInteger(value)) throw new Error('Native zone timeout was not returned');
             extra[key] = value;
         }
+        const sensitivity=Object.values(device.meta.fp400Saved??{}).find(setting=>setting.name===`zone_${id}_sensitivity`);
+        if(record.settleUntil!==undefined&&sensitivity)Object.assign(extra,await writeZoneSetting(device,id,device.getEndpoint(endpoint),sensitivity.name,sensitivityValues[sensitivity.value]));
     } else {
         if (endpoint !== undefined) throw new Error('Native zone still exists after removal');
         // A later zone with this ID may belong to another controller.
         for (const [key, setting] of Object.entries(device.meta.fp400Saved ?? {})) {
-            if (setting.name === `zone_${id}_absence_timeout`) delete device.meta.fp400Saved[key];
+            if ([`zone_${id}_absence_timeout`,`zone_${id}_sensitivity`].includes(setting.name)) delete device.meta.fp400Saved[key];
         }
     }
     const coordinator = context.coordinator ?? device.getEndpoint(1).binds.find(bind => bind.cluster.ID === 0x0406)?.target;
@@ -729,6 +829,8 @@ async function finishNativeZone(device, id, endpoints) {
     if (context.stopped) throw new Error('Native zone confirmation was interrupted');
     const {settleUntil, ...confirmed} = record;
     device.meta.fp400NativeZones[id] = {...confirmed, status: 'ready'};
+    context.catalogue?.delete(id);context.catalogueVerified=false;context.catalogueAt=0;
+    if(device.meta.fp400NativeObserved?.zones)delete device.meta.fp400NativeObserved.zones[id];
     await device.save();
     return extra;
 }
@@ -747,13 +849,18 @@ const fp400NativeControl = {
             let append = false, changed = false;
             try {
                 const endpoints = await readNativeZoneMap(device), endpoint = endpoints.get(id);
-                if (endpoint !== undefined && (!previous || previous.config === null) && !overwrite) throw new Error('Native zone already exists outside this card; confirm overwrite first');
+                if(meta.restoreMissing&&(endpoint!==undefined||context.options.restore_native_zones!==true||context.options.experimental_features!==true))throw new Error('Missing-zone restoration no longer applies');
+                if (endpoint !== undefined && !nativeOwned(device,id) && !overwrite) throw new Error('Native zone already exists outside this card; confirm overwrite first');
                 append = config !== null && endpoint === undefined;
                 if (append) {
                     const maximum = (await device.getEndpoint(1).read(configCluster, [17], manufacturerOptions))[17];
                     if (!Number.isInteger(maximum) || maximum < 1 || endpoints.size >= maximum) throw new Error('Native zone capacity is unavailable or full');
                 }
-                const record = {config, status: 'pending', error: '', ...(config && previous?.settleUntil ? {settleUntil: previous.settleUntil} : {})};
+                // Preserve the opaque native boolean when taking over an observed zone.
+                // Its physical meaning is not established; editing geometry must not toggle it.
+                const observedFlag=context.catalogue?.get(id)?.flag??previous?.wireFlag;
+                const wireFlag=[0,1].includes(observedFlag)?observedFlag:1;
+                const record = {config, ...(config?{wireFlag}:{}), status: 'pending', error: '', ...(config && previous?.settleUntil ? {settleUntil: previous.settleUntil} : {})};
                 device.meta.fp400NativeZones = {...device.meta.fp400NativeZones, [id]: record}; changed = true;
                 await device.save();
                 delete context.readings[id];
@@ -761,7 +868,7 @@ const fp400NativeControl = {
                 if (config || endpoint !== undefined) {
                     const command = config ? append ? 'appendZone' : 'updateZone' : 'removeZone';
                     const args = config ? {zone: [{elmType: 0x20, elmVal: id}, {elmType: 0x30, elmVal: 0},
-                        {elmType: 0x41, elmVal: Buffer.from(config.mask_hex, 'hex')}, {elmType: 0x10, elmVal: 1}]} : {zoneId: id};
+                        {elmType: 0x41, elmVal: Buffer.from(config.mask_hex, 'hex')}, {elmType: 0x10, elmVal: wireFlag}]} : {zoneId: id};
                     const result = await device.getEndpoint(1).command(configCluster, command, args, {...manufacturerOptions, disableDefaultResponse: false, disableResponse: false});
                     if (result?.errorCode !== 0) throw new Error(`Native ${command} was not acknowledged: ${JSON.stringify(result)}`);
                 }
@@ -793,6 +900,10 @@ async function maintainNativeZones(device, refresh = false) {
         if (refresh || context.dirty) {
             try {endpoints = await readNativeZoneMap(device); await readNativeReadings(device, endpoints); changed = true;} catch { /* retry failed maps on the next 10 s poll */ }
         }
+        if(context.options.experimental_features===true&&(refresh||Date.now()-(context.catalogueAt??0)>=60000)){
+            try{await readNativeCatalogueUnlocked(device);}catch{/* retain cached geometry, never infer absence from this failure */}
+            changed=true;
+        }
         for (const [id, record] of Object.entries(device.meta.fp400NativeZones ?? {})) {
             if (record.status !== 'pending' || record.settleUntil === undefined || record.settleUntil > Date.now()) continue;
             try {
@@ -804,12 +915,25 @@ async function maintainNativeZones(device, refresh = false) {
         }
         if (changed && !context.stopped) await publishNative(device, extra);
     });
+    if(context.options.experimental_features===true&&context.options.restore_native_zones===true&&restoreState(device).restore_status==='complete'&&context.catalogueVerified&&context.catalogueObservation?.count>=2){
+        const missing=Object.entries(device.meta.fp400NativeZones??{}).find(([id,r])=>r.status==='ready'&&r.config&&!context.catalogue.has(Number(id))&&!context.endpoints.has(Number(id)));
+        if(missing){
+            const [id,record]=missing,publish=context.publish??(()=>{});
+            try{await fp400NativeControl.convertSet(null,`native_zone_${id}_config`,record.config,{device,options:context.options,restoreMissing:true,publish});}
+            catch(error){logger.warning(`Native zone ${id} recovery: ${error.message}`,NS);}
+            context.catalogueObservation=null;
+        }
+    }
 }
 const nativeZoneExposes = Array.from({length: 8}, (_, i) => {
     const key = `native_zone_${i + 1}`;
     return [e.text(`${key}_config`, ea.ALL).withCategory('config').withDescription('Sensor zone JSON: name and mask_hex (80 hex characters). clear removes it. Use overwrite:true to replace an unmanaged ID. Timeout uses the separate zone number setting.'),
         e.enum(`${key}_status`, ea.STATE, ['ready', 'pending', 'error']).withCategory('diagnostic'),
         e.text(`${key}_error`, ea.STATE).withCategory('diagnostic'),
+        e.enum(`${key}_reporting`,ea.STATE,['reported','polled','unknown']).withCategory('diagnostic').withHomeAssistant({enabledByDefault:false}),
+        e.enum(`${key}_source`,ea.STATE,['observed','cached','acknowledged','unknown']).withCategory('diagnostic').withHomeAssistant({enabledByDefault:false}),
+        e.text(`${key}_event_raw`,ea.STATE).withCategory('diagnostic').withHomeAssistant({enabledByDefault:false}).withDescription('Experimental raw movement event mapped by the actual endpoint catalogue; no interpreted zone activity'),
+        e.binary(`${key}_owned`,ea.STATE,true,false).withCategory('diagnostic').withDescription('Whether editing this geometry is already authorized; false requires explicit takeover'),
         e.binary(`${key}_occupancy`, ea.STATE, true, false).withDescription('Presence reported by this native sensor zone; independent of software zones'),
         e.numeric(`${key}_count`, ea.STATE).withDescription('People reported by this native sensor zone')];
 }).flat();
@@ -818,7 +942,7 @@ const fp400NativeLifecycle = {
     onEvent: [async event => {
         if (!['start', 'deviceAnnounce', 'deviceOptionsChanged'].includes(event.type)) return;
         const {device, options} = event.data, context = nativeContext(device);
-        context.enabled = options.native_zones === true;
+        context.enabled = options.native_zones === true;context.options=options;
         if (event.type === 'deviceOptionsChanged') {
             if (event.data.from.native_zones === event.data.to.native_zones) return;
             event.data.deviceExposesChanged();
@@ -925,13 +1049,12 @@ export class SoftwareZoneTracker {
     constructor(zones = {}) {this.zones=zones;this.lastAt=null;this.outsideSince={};this.occupied={};this.inside={};this.lastSeen=new Map();this.still=new Map();this.awaiting=new Set();this.invalid=false;this.partial=false;this.presence=undefined;}
     // Returns the targets that entered or left each zone with this frame. When the report was cut short
     // (reported > targets.length), targets missing from it are assumed to stay where they were last seen;
-    // if even that cannot account for every target, no zone starts counting down to empty.
+    // missing positions cannot start or continue an absence countdown, even if their old positions are known.
     accept(targets, now, reported = targets.length) {
         this.lastAt=now;this.invalid=false;
         const decoded=new Set(targets.map(t=>t.id)),missing=reported-targets.length;
         this.partial=missing>0;
         const carried=missing>0?[...this.lastSeen.values()].filter(t=>!decoded.has(t.id)).sort((a,b)=>b.at-a.at).slice(0,missing):[];
-        const unaccounted=missing>carried.length;
         if (missing<=0) this.lastSeen.clear(); // a complete report is the whole truth
         for (const t of targets) this.lastSeen.set(t.id,{...t,at:now});
         // Where and since when each target has stayed put; a cut report says nothing about the targets it lost.
@@ -944,7 +1067,8 @@ export class SoftwareZoneTracker {
         for (const [id,z] of Object.entries(this.zones)) {
             const inside=all.filter(t=>inZone(t,z));
             if (inside.length) {this.occupied[id]=true;delete this.outsideSince[id];}
-            else if (!unaccounted && this.outsideSince[id]===undefined) this.outsideSince[id]=now;
+            else if (missing>0) delete this.outsideSince[id];
+            else if (this.outsideSince[id]===undefined) this.outsideSince[id]=now;
             const ids=new Set(inside.map(t=>t.id)), before=this.inside[id];
             if (before && !this.awaiting.has(Number(id))) {
                 for (const t of ids) if (!before.ids.has(t)) events.push({zone:Number(id),type:'enter'});
@@ -1031,29 +1155,38 @@ function zoneState(context) {
 // Every 10 s: put back settings the sensor lost (when due) and keep the position stream alive while zones exist.
 // The sensor never reports its area masks on its own, so read them at start and every 5 minutes; the card then
 // also shows changes made elsewhere (e.g. AI recognition).
-const regionsReadAt=new Map();
-export async function fp400Poll(device) {
-    await maintainNativeZones(device);
+const regionsReadAt=new Map(), trackingLease=new Map();
+export async function fp400Poll(device, options) {
+    if(options){nativeContext(device).options=options;nativeContext(device).enabled=options.native_zones===true;}
+    options??=nativeContext(device).options;
     // Room presence is only reported when it changes, so read it once for the zones to start from.
     if (softwareZoneContexts.get(device.ieeeAddr)?.tracker.presence===undefined) {
         try {await device.getEndpoint(1).read('msOccupancySensing', ['occupancy']);} catch {/* the next poll tries again */}
     }
-    if (!restoreChecked.has(device.ieeeAddr)) {
+    if (!restoreChecked.has(device.ieeeAddr) && Date.now()>=(restoreProgress.get(device.ieeeAddr)?.nextAt??0)) {
+        let result;
         try {
-            const restored = await withDeviceLock(device, () => restoreSettings(device));
-            restoreChecked.add(device.ieeeAddr);
-            if (restored.length) logger.info(`FP400 '${device.ieeeAddr}' lost settings (usually a power cut); put back: ${restored.join(', ')}`, NS);
-        } catch {/* the sensor did not answer; the next poll tries again */}
+            result = await withDeviceLock(device, () => restoreSettings(device));
+        } catch(error) {result={restored:[],failed:[error.message??String(error)],unsupported:[]};}
+        const {restored,failed,unsupported}=result,attempt=(restoreProgress.get(device.ieeeAddr)?.attempt??0)+1;
+        if (!failed.length) restoreChecked.add(device.ieeeAddr);
+        updateRestoreProgress(device, {status:failed.length?'pending':unsupported.length?'error':'complete',
+            error:[...failed,...unsupported.map(name=>`${name}: unsupported by this firmware`)].join('; '),attempt,
+            nextAt:Date.now()+[10000,30000,60000,300000][Math.min(attempt-1,3)]});
+        if (restored.length) logger.info(`FP400 '${device.ieeeAddr}' lost settings (usually a power cut); put back: ${restored.join(', ')}`, NS);
     }
+    await maintainNativeZones(device);
     await forgetStillTargets(device);
-    if (Object.keys(device.meta.fp400SoftwareZones ?? {}).length || device.meta.fp400ForgetStill) await subscribeTracking(device);
+    if ((options.tracking_mode==='always' || Object.keys(device.meta.fp400SoftwareZones ?? {}).length || device.meta.fp400ForgetStill) && Date.now()>=(trackingLease.get(device.ieeeAddr)??0)) await subscribeTracking(device);
     if (Date.now()-(regionsReadAt.get(device.ieeeAddr) ?? 0) < 300000) return;
     await withDeviceLock(device, async () => {
         for (const id of Object.values(regionAttributes)) {
             const data = await device.getEndpoint(1).read(configCluster, [id], manufacturerOptions);
             // A kept area that reads empty: the sensor lost power without its announcement reaching us.
             const kept = device.meta.fp400Saved?.[`1/${configCluster}/${id}`]?.value;
-            if (kept && !emptyMask(kept) && data?.[id] !== undefined && emptyMask(regionBuffer(data[id]).toString('hex'))) restoreChecked.delete(device.ieeeAddr);
+            if (kept && !emptyMask(kept) && data?.[id] !== undefined && emptyMask(regionBuffer(data[id]).toString('hex'))) {
+                restoreChecked.delete(device.ieeeAddr);restoreProgress.delete(device.ieeeAddr);
+            }
         }
     });
     regionsReadAt.set(device.ieeeAddr, Date.now());
@@ -1081,6 +1214,7 @@ async function subscribeTracking(device, seconds=120) {
     const result=await device.getEndpoint(1).command('aqaraFp400Location','subscribeLocationData',{timeout:seconds},
         {...manufacturerOptions,disableDefaultResponse:false,disableResponse:false});
     if (result?.statusCode!==0) throw new Error(`Tracking subscription not acknowledged: ${JSON.stringify(result)}`);
+    trackingLease.set(device.ieeeAddr,Date.now()+Math.max(0,seconds-30)*1000);
 }
 const softwareZoneControl={
     key:Array.from({length:8},(_,i)=>`software_zone_${i+1}_config`),
@@ -1106,7 +1240,7 @@ const softwareZoneHeartbeat={
     convert:(model,msg,publish,options)=>{
         if(msg.endpoint.ID!==1)return;
         const native = nativeContext(msg.device); native.enabled = options?.native_zones === true; native.publish = publish;
-        return {...nativeZoneState(msg.device), ...zoneState(softwareContext(msg.device,publish)), map_rotation:msg.device.meta.fp400MapRotation ?? 0,
+        return {converter_version:CONVERTER_VERSION,...nativeZoneState(msg.device), ...zoneState(softwareContext(msg.device,publish)), map_rotation:msg.device.meta.fp400MapRotation ?? 0,
             forget_still_targets:msg.device.meta.fp400ForgetStill ?? 0};
     },
 };
@@ -1189,10 +1323,15 @@ export function decodeMotionEvent(data) {
 }
 const fp400Motion = {
     cluster: 'aqaraFp400Radar', type: ['raw'],
-    convert: (model, msg) => {
+    convert: (model, msg, publish, options) => {
         if (!Buffer.isBuffer(msg.data) || msg.data[4] !== 0x8b) return;
         const action = decodeMotionEvent(msg.data);
-        return {motion_last_frame: msg.data.toString('hex').slice(0, 80), ...(action && msg.endpoint.ID === 1 ? {action} : {})};
+        const state = {motion_last_frame: msg.data.toString('hex').slice(0, 80), ...(action && msg.endpoint.ID === 1 ? {action} : {})};
+        if(msg.endpoint.ID!==1&&msg.device&&options?.native_zones===true&&options.experimental_features===true&&msg.data.length>=8&&[0x0c,0x1c].includes(msg.data[0])&&msg.data.readUInt16LE(1)===0x115f){
+            const context=nativeContext(msg.device),id=[...(context.endpoints??[])].find(([,endpoint])=>endpoint===msg.endpoint.ID)?.[0];
+            if(!context.dirty&&id>=1&&id<=8)state[`native_zone_${id}_event_raw`]=JSON.stringify({endpoint:msg.endpoint.ID,event_id:msg.data.readUInt16LE(5),hex:msg.data.toString('hex').slice(0,240)});
+        }
+        return state;
     },
 };
 // FC0C command 1: the sensor drops one track, e.g. a ghost. A real person is simply picked up again.
@@ -1246,12 +1385,19 @@ async function configureNativeReporting(device, coordinatorEndpoint, endpoints) 
     if (endpoints === undefined) {
         try {endpoints = await readNativeZoneMap(device);} catch {endpoints = null;}
     }
+    if (endpoints) endpoints = new Map([...endpoints].sort(([a],[b])=>a-b));
     const zones = endpoints ? [...endpoints.keys()] : null;
     const occupancy = max => [{attribute: 'occupancy', minimumReportInterval: 0, maximumReportInterval: max, reportableChange: 0}];
     // Converter 0.4 and older reported endpoints 3-6. A maximum interval of 0xFFFF stops a report and frees its entry.
-    const unused = endpoints ? zoneSlots.filter(({endpoint}) => ![...endpoints.values()].includes(endpoint)) : [];
-    for (const {endpoint} of unused) {
+    const wanted = new Set(endpoints ? [...endpoints.values()].slice(0,4) : []);
+    const managed = new Set([...zoneSlots.map(slot=>slot.endpoint),...(device.meta.fp400Reporting?.reported??[]).filter(id=>id!==2)]);
+    const unused = endpoints ? [...managed].filter(endpoint=>!wanted.has(endpoint)) : [];
+    for (const endpoint of unused) {
         try {await device.getEndpoint(endpoint).configureReporting('msOccupancySensing', occupancy(0xffff));} catch {}
+    }
+    if (endpoints && endpoints.size>=4) {
+        try {await device.getEndpoint(2).configureReporting('msIlluminanceMeasurement', [{attribute:'measuredValue',minimumReportInterval:10,maximumReportInterval:0xffff,reportableChange:5}]);}
+        catch { /* if the old entry cannot be freed, unsuccessful zone reports still fall back to polling */ }
     }
     const reported = [];
     const report = async (id, cluster, items) => {
@@ -1268,7 +1414,7 @@ async function configureNativeReporting(device, coordinatorEndpoint, endpoints) 
     }
     await report(2, 'msIlluminanceMeasurement', [{attribute: 'measuredValue', minimumReportInterval: 10, maximumReportInterval: 3600, reportableChange: 5}]);
     device.meta.fp400Reporting = {reported, zones};
-    device.save();
+    await device.save();
 }
 export const fp400ReportingSlots = {
     isModernExtend: true,
@@ -1294,7 +1440,7 @@ export async function fp400UnreportedPoll(device) {
         const context = nativeContext(device);
         const endpoints = context.enabled ? context.endpoints : null;
         // An unused or temporarily unavailable zone must not block the others.
-        for (const id of polledZoneEndpoints(device)) {
+        for (const id of context.enabled ? [] : polledZoneEndpoints(device)) {
             try {await device.getEndpoint(id).read('msOccupancySensing', ['occupancy']);} catch {}
         }
         for (const endpoint of endpoints?.values() ?? []) {
@@ -1302,6 +1448,23 @@ export async function fp400UnreportedPoll(device) {
         }
     });
     if (failure) throw failure;
+}
+export async function fp400NativePresencePoll(device, options = {}) {
+    if(options.native_zones!==true)return;
+    const interval=options.native_zone_poll_interval??60;
+    if(!Number.isInteger(interval)||interval<10||interval>300)throw new Error('native_zone_poll_interval must be 10..300 seconds');
+    await withDeviceLock(device,async()=>{
+        const context=nativeContext(device);context.enabled=true;
+        const endpoints=context.endpoints??await readNativeZoneMap(device);
+        for(const [id,ep] of endpoints){
+            if(id<1||id>8||device.meta.fp400Reporting?.reported.includes(ep))continue;
+            try{
+                const raw=(await device.getEndpoint(ep).read('msOccupancySensing',['occupancy'])).occupancy;
+                if(Number.isInteger(raw))(context.readings[id]??={}).occupancy=(raw&1)!==0;
+            }catch{/* no response cannot become absence */}
+        }
+        await publishNative(device);
+    });
 }
 
 export default {
@@ -1328,13 +1491,20 @@ export default {
         fp400NativeReport, {...fp400NativeReport, cluster: 'aqaraFp400Radar'}, {...fp400NativeReport, cluster: '64523'},
         ...attributeSyncConverters,
     ],
-    toZigbee: [fp400NativeControl, softwareZoneControl, fp400MapRotation, fp400ForgetStill, fp400RemoveTarget, fp400ZoneSettingsControl, fp400CapacityGet,
-        ...fp400InstallationControl.key.map(key => ({...fp400InstallationControl, key: [key]})),
+    toZigbee: [fp400NativeControl, softwareZoneControl, fp400MapRotation, fp400ForgetStill, fp400RemoveTarget, fp400ZoneSettingsControl, fp400CapacityGet, fp400RestoreDiagnostics,
+        ...fp400InstallationControl.key.map(key => ({...serializedSetting(fp400InstallationControl), key: [key]})),
         ...fp400RegionControl.key.map(key => ({...fp400RegionControl, key: [key]})),
         ...fp400RegionGet.key.map(key => ({...fp400RegionGet, key: [key]})),
-        ...fp400AreaControl.key.map(key => ({...fp400AreaControl, key: [key]})), fp400Refresh, ...Object.keys(configOptions).map((key) => ({...fp400ConfigControl, key: [key]})), fp400Learning, fp400SensitivityControl, fp400AbsenceControl, fp400DepthControl],
-    options: [e.binary('native_zones', ea.SET, true, false).withDescription('Enable native sensor zone editing and telemetry (default: false)')],
+        ...fp400AreaControl.key.map(key => ({...fp400AreaControl, key: [key]})), fp400Refresh, ...Object.keys(configOptions).map((key) => ({...serializedSetting(fp400ConfigControl), key: [key]})), fp400Learning, serializedSetting(fp400SensitivityControl), serializedSetting(fp400AbsenceControl), fp400DepthControl],
+    options: [e.binary('native_zones', ea.SET, true, false).withDescription('Enable native sensor zone editing and telemetry (default: false)'),
+        e.binary('experimental_features',ea.SET,true,false).withDescription('Enable complete-catalogue research reads and optional recovery; requires hardware validation (default: false)'),
+        e.binary('restore_native_zones',ea.SET,true,false).withDescription('With experimental_features, restore previously confirmed missing zones after two complete matching catalogues (default: false)'),
+        e.enum('tracking_mode',ea.SET,['auto','always']).withDescription('auto subscribes while software zones or still-target forgetting need it; always also keeps the map live with native-only zones (default: auto)')],
     exposes: (device, options = {}) => [...(options.native_zones === true ? nativeZoneExposes : []), ...softwareZoneExposes, ...fp400TrackingExposes,
+        ...(options.native_zones===true?[e.enum('native_catalogue_status',ea.STATE,['observed','uncertain','unread']).withCategory('diagnostic').withHomeAssistant({enabledByDefault:false}),e.text('native_catalogue_error',ea.STATE).withCategory('diagnostic').withHomeAssistant({enabledByDefault:false})]:[]),
+        e.enum('restore_status',ea.STATE_GET,['pending','complete','error']).withCategory('diagnostic').withHomeAssistant({enabledByDefault:false})
+            .withDescription('Configuration recovery: pending retries temporary failures; error identifies saved settings unsupported by the firmware'),
+        e.text('restore_error',ea.STATE_GET).withCategory('diagnostic').withHomeAssistant({enabledByDefault:false}).withDescription('Settings or persistent backup that could not be confirmed'),
         ...fp400ZoneExposes,
         ...fp400AdditionalExposes,
         e.numeric('detection_depth', ea.ALL).withUnit('m').withValueMin(0.5).withValueMax(10).withValueStep(0.5).withCategory('config')
@@ -1356,9 +1526,7 @@ export default {
     // Tracking (re)starts from the 10 s poll below: on 'start' this hook runs before the custom clusters exist.
     onEvent: async(event)=>{
         // The sensor announces itself when power returns, with its areas and mounting forgotten.
-        if(event.type==='deviceAnnounce') {
-            restoreChecked.delete(event.data.device.ieeeAddr);
-        }
+        if(event.type==='deviceAnnounce') {restoreChecked.delete(event.data.device.ieeeAddr);restoreProgress.delete(event.data.device.ieeeAddr);trackingLease.delete(event.data.device.ieeeAddr);}
         if(event.type==='stop') {
             const context=softwareZoneContexts.get(event.data.ieeeAddr);
             if(context)clearInterval(context.timer);
@@ -1369,6 +1537,8 @@ export default {
             const native = nativeContexts.get(event.data.ieeeAddr);
             if (native) {native.stopped = true; native.publish = undefined;}
             nativeContexts.delete(event.data.ieeeAddr);
+            restoreProgress.delete(event.data.ieeeAddr);persistencePending.delete(event.data.ieeeAddr);
+            trackingLease.delete(event.data.ieeeAddr);
         }
     },
     extend: [
@@ -1402,6 +1572,8 @@ export default {
         }),
         fp400NativeLifecycle,
         m.poll({key:'fp400_tracking_subscription',defaultIntervalSeconds:10,poll:fp400Poll}),
+        m.poll({key:'fp400_native_presence',optionKey:'native_zone_poll_interval',defaultIntervalSeconds:60,poll:fp400NativePresencePoll,
+            option:e.numeric('native_zone_poll_interval',ea.SET).withValueMin(10).withValueMax(300).withValueStep(1).withUnit('s').withDescription('Poll native occupancy without a reporting slot (default: 60). Counts and light keep their separate interval.')}),
         m.deviceEndpoints({
             multiEndpointSkip: [...nativeZoneExposes.map(expose => expose.property), ...zoneSettingKeys, 'maximum_detection_targets', ...Object.keys(configOptions), ...fp400AdditionalExposes.map(expose => expose.property), 'spatial_learning', 'detection_depth', 'presence_sensitivity', 'absence_timeout'],
             endpoints: Object.fromEntries(Array.from({length: 10}, (_, i) => [String(i + 1), i + 1])),

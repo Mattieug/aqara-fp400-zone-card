@@ -90,6 +90,13 @@ test('non-admins subscribe to no MQTT and retain entity-state fallback with clea
     assert.match(help,/administrator/);assert.match(help,/sensor.living_room_fp400_targets_xy/);
     assert.match(help,/sensor.living_room_fp400_tracking_last_update/);
 });
+test('unavailable tracking entities indicate an offline device, not missing administrator rights',()=>{
+    const {card}=fixture({admin:false});
+    for(const entity of Object.values(card._hass.states))entity.state='unavailable';
+    assert.equal(card.liveTrackingHelp(),null);
+    delete card._hass.states['sensor.living_room_fp400_tracking_last_update'];
+    assert.equal(card.liveTrackingHelp(),null,'offline diagnosis takes priority even with a disabled timestamp entity');
+});
 
 test('old topics cannot update UI after the device changes',async()=>{
     const {card,handlers,unsubscribed}=fixture();

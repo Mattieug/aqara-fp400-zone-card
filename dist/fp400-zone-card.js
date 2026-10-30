@@ -1,5 +1,5 @@
 /* Aqara FP400 zone card for Home Assistant + Zigbee2MQTT. https://github.com/bobtekkk/aqara-fp400-zone-card (MIT License) */
-const VERSION = '0.5.0';
+const VERSION = '0.6.0-dev.1';
 const COLORS = ['#67e4b8','#9fa9ff','#f9bf73','#f28fad','#68cce8','#d6a0ef','#bddb79','#ff9d7a'];
 const LIMITS = {x_min:-400,x_max:400,y_min:-50,y_max:1000};
 // The sensor's own area masks, in sidebar order. The map draws them in reverse, so ignore spots end up on top.
@@ -35,6 +35,57 @@ const SETTINGS = [
 ];
 // What the card names a zone's entities in Home Assistant, e.g. "Desk occupancy".
 const ENTITY_NAMES = [['binary_sensor','occupancy','occupancy','occupancy'],['binary_sensor','available','tracking available'],['text','config','zone configuration'],['sensor','count','people'],['sensor','activity','activity']];
+const backupSettings=()=>[...SETTINGS.flatMap(([,items])=>items),...Array.from({length:8},(_,i)=>[
+    ['number',`zone_${i+1}_absence_timeout`,`Sensor zone ${i+1} empty delay`,{min:0,max:300}],
+    ['select',`zone_${i+1}_sensitivity`,`Sensor zone ${i+1} sensitivity`,{low:'Low',medium:'Medium',high:'High'}],
+]).flat()];
+const unknownState=value=>[undefined,null,'','unknown','unavailable'].includes(value);
+function backupSettingValue(key,value){
+    const item=backupSettings().find(([,k])=>k===key);if(!item)throw new Error(`Unsupported backup setting: ${key}`);
+    const [domain,,,extra]=item;
+    if(domain==='switch'){if(!['on','off'].includes(value))throw new Error(`Invalid ${key}`);return value;}
+    if(domain==='select'){if(!Object.hasOwn(extra,value))throw new Error(`Invalid ${key}`);return value;}
+    const [min,max]=key==='installation_height'?[1,65535]:key==='map_rotation'?[-180,180]:key==='forget_still_targets'?[0,240]:[0,300];
+    if(typeof value!=='number'||!Number.isFinite(value)||value<min||value>max||(key!=='map_rotation'&&!Number.isInteger(value)))throw new Error(`Invalid ${key}`);
+    return value;
+}
+export function normalizeBackup(input){
+    const value=typeof input==='string'?JSON.parse(input):input;
+    if(!value||value.format!=='aqara-fp400'||value.version!==1)throw new Error('Unsupported FP400 backup format or version');
+    const configuration={settings:{},areas:{},software_zones:{},native_zones:{}};
+    const source=value.configuration;if(!source||typeof source!=='object'||Array.isArray(source))throw new Error('Backup configuration is missing');
+    for(const key of Object.keys(source))if(!Object.hasOwn(configuration,key))throw new Error(`Unknown backup section: ${key}`);
+    for(const [section,entries] of Object.entries(configuration)){
+        const supplied=source[section]??{};if(!supplied||typeof supplied!=='object'||Array.isArray(supplied))throw new Error(`Invalid ${section}`);
+        for(const [key,v] of Object.entries(supplied)){
+            if(section==='settings')entries[key]=backupSettingValue(key,v);
+            else if(section==='areas'){if(!Object.hasOwn(AREAS,key)||!maskBits(v))throw new Error(`Invalid area ${key}`);entries[key]=v.toLowerCase();}
+            else {
+                if(!/^[1-8]$/.test(key))throw new Error('Zone IDs must be 1..8');
+                const z=section==='native_zones'?normalizeNativeZone(v):normalizeZone(v);
+                if(z==='unmanaged')throw new Error('Uncertain native geometry cannot be imported');entries[key]=z;
+            }
+        }
+    }
+    return {format:'aqara-fp400',version:1,device:typeof value.device==='string'?value.device:null,configuration};
+}
+export function planBackupImport(backup,current){
+    const wanted=normalizeBackup(backup).configuration,operations=[];
+    for(const section of ['settings','software_zones','native_zones','areas'])for(const [key,after] of Object.entries(wanted[section])){
+        const before=current[section]?.[key],creatingSetting=/^zone_([1-8])_/.exec(key);
+        const created=section==='settings'&&creatingSetting&&current.native_zones?.[creatingSetting[1]]===null&&wanted.native_zones[creatingSetting[1]];
+        if(before===undefined&&!created)throw new Error(`${section} ${key} is unavailable. Read it from the sensor before importing.`);
+        if(JSON.stringify(before)===JSON.stringify(after))continue;
+        let label;
+        if(section==='settings')label=`${backupSettings().find(([,k])=>k===key)[2]}: ${before??'new zone'} → ${after}`;
+        else if(section==='areas'){
+            const a=maskBits(before),b=maskBits(after);label=`${AREAS[key].label}: ${[...b].filter(x=>!a.has(x)).length} cells added, ${[...a].filter(x=>!b.has(x)).length} removed`;
+        }else label=`${section==='native_zones'?'Sensor':'Software'} zone ${key}: ${after?after.name:'delete'}`;
+        const rank=section==='settings'?/^zone_/.test(key)?4:['installation_mode','side_installation','installation_height','coordinate_reverse'].includes(key)?0:1:section==='areas'?2:3;
+        operations.push({section,key,before,after,label,rank,created:Boolean(created),...(created?{parentConfig:wanted.native_zones[creatingSetting[1]]}:{})});
+    }
+    return operations.sort((a,b)=>a.rank-b.rank);
+}
 const escapeHTML = value => String(value).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const clone = value => value == null ? null : typeof value==='string' ? value : {...value};
 const clamp = (v,a,b) => Math.max(a,Math.min(b,v));
@@ -101,6 +152,10 @@ export function parseTargets(value) {
         const parts=item.split(':').map(Number);
         return parts.length===3 && parts.every(Number.isFinite)?[{id:parts[0],x:parts[1],y:parts[2]}]:[];
     });
+}
+export function observedTargets(value){
+    if(!Array.isArray(value)||value.length>10||value.some(t=>!t||!Number.isInteger(t.id)||t.id<0||t.id>65535||![t.x,t.y].every(n=>Number.isFinite(n)&&Math.abs(n)<=2000)))return null;
+    return value.map(t=>Object.fromEntries(['id','x','y','activity','cell','fall','posture','zone','in_zone'].filter(k=>Number.isFinite(t[k])).map(k=>[k,t[k]])));
 }
 // A view (map coordinates) around the given points and the sensor, inside the range of a map turned by deg.
 export function fitView(points,deg=0) {
@@ -245,14 +300,29 @@ export class FP400ZoneCard extends (globalThis.HTMLElement ?? class {}) {
     zoneKey(id,suffix){return `${this.native?'native':'software'}_zone_${id}_${suffix}`;}
     normalize(value){return this.native?normalizeNativeZone(value):normalizeZone(value);}
     same(a,b){return this.native?JSON.stringify(normalizeNativeZone(a))===JSON.stringify(normalizeNativeZone(b)):sameZone(a,b);}
-    nativeOverwrite(id){return this.base[id]==='unmanaged'||this.saved[id]==='unmanaged'||this.state('text',`native_zone_${id}_config`)==='unmanaged';}
+    nativeOverwrite(id){return this.base[id]==='unmanaged'||this.saved[id]==='unmanaged'||this.state('text',`native_zone_${id}_config`)==='unmanaged'||(this.state('binary_sensor',`native_zone_${id}_owned`)==='off'&&!['clear',undefined,'unknown','unavailable'].includes(this.state('text',`native_zone_${id}_config`)));}
     nativeStatus(id){return this.state('sensor',`native_zone_${id}_status`);}
+    async adoptNative(id){
+        if(!this.native||this.saving||!this.saved[id]||this.saved[id]==='unmanaged')return;
+        if(this.dirty.size||this.pendingAreas.length||this.pendingClears.size){this.notice('Save or discard edits before adopting this geometry.','error');return;}
+        if(!this.overwriteNative.has(id)){this.notice(`Confirm writing sensor zone ${id} first.`,'error');return;}
+        const config=normalizeNativeZone(this.saved[id]);this.saving=true;this.render();
+        try{
+            await this._hass.callService('text','set_value',{entity_id:this.entity('text',`native_zone_${id}_config`),value:JSON.stringify({...config,overwrite:true})});
+            await this.waitUntil(()=>this.nativeStatus(id)==='ready'&&this.state('binary_sensor',`native_zone_${id}_owned`)==='on'&&this.same(this.saved[id],config),'Geometry takeover was not confirmed.',45000);
+            this.overwriteNative.delete(id);this.notice('Existing geometry adopted.','success');
+        }catch(error){this.notice(error.message,'error');}
+        finally{this.saving=false;this.render();}
+    }
     nativeEditable(id){return this.loaded.has(id)&&['ready','error'].includes(this.nativeStatus(id))&&!['unknown','unavailable',undefined].includes(this.state('text',`native_zone_${id}_config`));}
     hasNativeControls(){return Array.from({length:8},(_,i)=>this.state('text',`native_zone_${i+1}_config`)).some(value=>value!==undefined);}
-    nativeTimeoutBusy(){for(let id=1;id<=8;id++)if(this.busy[this.entity('number',`zone_${id}_absence_timeout`)])return true;return false;}
+    nativeTimeoutBusy(){for(let id=1;id<=8;id++)if(this.busy[this.entity('number',`zone_${id}_absence_timeout`)]||this.busy[this.entity('select',`zone_${id}_sensitivity`)])return true;return false;}
     nativeTimeoutReady(id){
-        const z=this.saved[id],value=this.state('number',`zone_${id}_absence_timeout`);
-        return Boolean(this.native&&z&&z!=='unmanaged'&&!this.saving&&this.nativeEditable(id)&&this.nativeStatus(id)==='ready'&&value!==undefined&&value!==''&&Number.isFinite(Number(value)));
+        return this.nativeSettingReady(id,'absence_timeout');
+    }
+    nativeSettingReady(id,key){
+        const z=this.saved[id],value=this.state(key==='sensitivity'?'select':'number',`zone_${id}_${key}`);
+        return Boolean(this.native&&z&&z!=='unmanaged'&&!this.saving&&this.nativeEditable(id)&&this.nativeStatus(id)==='ready'&&this.state('binary_sensor',`native_zone_${id}_owned`)!=='off'&&value!==undefined&&value!==''&&(key==='sensitivity'?['low','medium','high'].includes(value):Number.isFinite(Number(value))));
     }
     switchZones(){
         if(this.saving||this.drag||this.dirty.size||this.pendingAreas.length||this.pendingClears.size||(this.native&&this.nativeTimeoutBusy())){this.notice('Save or discard your changes before switching zone types.','error');return;}
@@ -280,8 +350,9 @@ export class FP400ZoneCard extends (globalThis.HTMLElement ?? class {}) {
         const keys=[['sensor','targets_xy'],['sensor','tracking_status'],['sensor','tracking_last_update'],['text','remove_target'],['sensor','learning_result_time'],['button','spatial_learning'],['button','refresh_configuration']];
         for(const type of Object.keys(AREAS))keys.push(['sensor',`${type}_mask_hex`],['text',`${type}_mask_hex`],['text',`${type}_zone_add`],['text',`${type}_zone_remove`],['text',`${type}_clear`]);
         for(let i=1;i<=8;i++)keys.push(['text',`software_zone_${i}_config`],['binary_sensor',`software_zone_${i}_occupancy`],['binary_sensor',`software_zone_${i}_available`],['sensor',`software_zone_${i}_count`],['sensor',`software_zone_${i}_activity`]);
-        for(let i=1;i<=8;i++)keys.push(['text',`native_zone_${i}_config`],['sensor',`native_zone_${i}_status`],['sensor',`native_zone_${i}_error`],['binary_sensor',`native_zone_${i}_occupancy`],['sensor',`native_zone_${i}_count`],['number',`zone_${i}_absence_timeout`]);
+        for(let i=1;i<=8;i++)keys.push(['text',`native_zone_${i}_config`],['sensor',`native_zone_${i}_status`],['sensor',`native_zone_${i}_error`],['binary_sensor',`native_zone_${i}_occupancy`],['sensor',`native_zone_${i}_count`],['number',`zone_${i}_absence_timeout`],['select',`zone_${i}_sensitivity`],['sensor',`native_zone_${i}_reporting`],['sensor',`native_zone_${i}_source`],['binary_sensor',`native_zone_${i}_owned`]);
         for(const [,items] of SETTINGS)for(const [domain,key] of items)keys.push([domain,key]);
+        keys.push(['sensor','learning_state'],['sensor','learning_result_code'],['sensor','areas_read_time']);
         return keys.map(([domain,key])=>this.entity(domain,key));
     }
     get hass(){return this._hass;}
@@ -316,15 +387,15 @@ export class FP400ZoneCard extends (globalThis.HTMLElement ?? class {}) {
                 let data;
                 try{data=JSON.parse(message.payload);}catch{return;}
                 if(!data||typeof data!=='object'||Array.isArray(data))return;
-                const keys=['targets_xy','tracking_last_update','tracking_status',
-                    'interference_mask_hex','entry_exit_mask_hex','edge_mask_hex','learning_result_time']
+                const keys=['targets_xy','tracking_targets','tracking_last_update','tracking_status',
+                    'interference_mask_hex','entry_exit_mask_hex','edge_mask_hex','learning_result_time','learning_state','learning_result_code','areas_read_time','converter_version','native_catalogue_status','native_catalogue_error',...Array.from({length:8},(_,i)=>['reporting','source'].map(k=>`native_zone_${i+1}_${k}`)).flat()]
                     .filter(key=>Object.hasOwn(data,key));
                 if(!keys.length)return;
                 const next={...this.liveTracking};let editorChanged=false,positionsChanged=false;
                 for(const key of keys){
                     if(next[key]===data[key])continue;
                     next[key]=data[key];
-                    if(key.endsWith('_mask_hex')||key==='learning_result_time')editorChanged=true;
+                    if(key.endsWith('_mask_hex')||key.startsWith('learning_')||key.startsWith('native_'))editorChanged=true;
                     else positionsChanged=true;
                 }
                 if(!editorChanged&&!positionsChanged)return;
@@ -345,8 +416,9 @@ export class FP400ZoneCard extends (globalThis.HTMLElement ?? class {}) {
     }
     trackingValue(key){return this.liveTracking?.[key]??this.state('sensor',key);}
     liveTrackingHelp(){
+        if(this.state('text','software_zone_1_config')==='unavailable'||this.state('sensor','tracking_status')==='unavailable')return null;
         const keys=['targets_xy','tracking_last_update','tracking_status'];
-        const missing=keys.filter(key=>!this.available('sensor',key));
+        const missing=keys.filter(key=>this.state('sensor',key)===undefined);
         if(!missing.length)return null;
         const names=missing.map(key=>this.entity('sensor',key)).join(', ');
         if(!this._hass?.user?.is_admin)return `Live dots need a Home Assistant administrator account, or enable these HA entities: ${names}.`;
@@ -354,10 +426,90 @@ export class FP400ZoneCard extends (globalThis.HTMLElement ?? class {}) {
         return null;
     }
     connectedCallback(){this.clock??=setInterval(()=>{if(this.mounted)this.renderLive();},1000);if(this.mounted)this.resizeObs?.observe(this.svg);void this.ensureTrackingSubscription();}
-    disconnectedCallback(){clearInterval(this.clock);this.clock=null;clearTimeout(this.learnTimer);this.resizeObs?.disconnect();this.stopTrackingSubscription();}
+    disconnectedCallback(){clearInterval(this.clock);this.clock=null;clearTimeout(this.learnTimer);clearTimeout(this.learnResultTimer);this.learnBefore=undefined;this.resizeObs?.disconnect();this.stopTrackingSubscription();}
     entity(domain,key){return this.fp?.keys?.[`${domain}.${key}`]??`${domain}.${this.device}_${key}`;}
     state(domain,key){return this._hass?.states?.[this.entity(domain,key)]?.state;}
     available(domain,key){return !['unavailable',undefined].includes(this.state(domain,key));}
+    configurationSnapshot(){
+        const configuration={settings:{},areas:{},software_zones:{},native_zones:{}},unavailable=[];
+        for(const [domain,key] of backupSettings()){
+            const raw=this.state(domain,key);if(unknownState(raw)){unavailable.push(key);continue;}
+            try{configuration.settings[key]=backupSettingValue(key,domain==='number'?Number(raw):raw);}catch{unavailable.push(key);}
+        }
+        for(const type of Object.keys(AREAS)){
+            const value=this.areaMask(type);if(maskBits(value))configuration.areas[type]=value;else unavailable.push(`${type}_mask_hex`);
+        }
+        for(const mode of ['software','native'])for(let id=1;id<=8;id++){
+            const raw=this.state('text',`${mode}_zone_${id}_config`);if(unknownState(raw)||raw==='unmanaged'||(mode==='native'&&this.state('sensor',`native_zone_${id}_status`)!=='ready')){unavailable.push(`${mode}_zone_${id}`);continue;}
+            try{configuration[`${mode}_zones`][id]=mode==='native'?normalizeNativeZone(raw):normalizeZone(raw);}catch{unavailable.push(`${mode}_zone_${id}`);}
+        }
+        for(const key of Object.keys(configuration.settings)){const zone=/^zone_([1-8])_/.exec(key);if(zone&&!configuration.native_zones[zone[1]]){delete configuration.settings[key];unavailable.push(key);}}
+        return {configuration,unavailable};
+    }
+    configurationBackup(){return {format:'aqara-fp400',version:1,card_version:VERSION,converter_version:this.trackingValue('converter_version')??null,firmware_version:this._hass?.devices?.[this.fp?.deviceId]?.sw_version??null,created_at:new Date().toISOString(),device:this.fp?.ieee??this.device,...this.configurationSnapshot()};}
+    downloadBackup(){
+        const url=URL.createObjectURL(new Blob([JSON.stringify(this.configurationBackup(),null,2)],{type:'application/json'})),link=document.createElement('a');
+        link.href=url;link.download=`fp400-${new Date().toISOString().slice(0,10)}.json`;link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
+        this.notice('Downloaded known configuration. Unavailable fields are listed in the file and are never treated as deleted.');
+    }
+    async previewBackupFile(file){
+        if(!file||this.saving)return;
+        try{
+            if(file.size>262144)throw new Error('Backup file exceeds 256 KiB');
+            if(this.dirty.size||this.pendingAreas.length||this.pendingClears.size)throw new Error('Save or discard your edits before importing.');
+            const backup=normalizeBackup(await file.text()),device=this.fp?.ieee??this.device;
+            if(/^0x[0-9a-f]{16}$/i.test(device)&&/^0x[0-9a-f]{16}$/i.test(backup.device)&&device!==backup.device)throw new Error('This backup belongs to a different FP400. Select its card first.');
+            const operations=planBackupImport(backup,this.configurationSnapshot().configuration);
+            for(const op of operations){const id=op.section==='native_zones'?op.key:op.section==='settings'?/^zone_([1-8])_/.exec(op.key)?.[1]:null;if(id&&this.state('text',`native_zone_${id}_config`)!=='clear'&&this.state('binary_sensor',`native_zone_${id}_owned`)==='off')throw new Error(`Adopt sensor zone ${id} explicitly before importing into it.`);}
+            this.importPlan={device,operations,completed:0};this.notice(operations.length?`${operations.length} configuration changes ready for review.`:'Backup already matches the known configuration.');
+        }catch(error){this.importPlan=null;this.notice(error.message,'error');}
+        this.renderSettings();
+    }
+    backupPanel(){
+        const plan=this.importPlan,disabled=this.saving?'disabled':'';
+        return `<h2 class="section-title">CONFIGURATION BACKUP</h2><button class="btn" data-action="backup-export" ${disabled}>Download known configuration</button><label class="field">Preview a backup<input type="file" accept=".json,application/json" data-backup-file ${disabled}/></label>`+
+            (plan?`<p class="small-note">${plan.completed} confirmed · ${plan.operations.length} remaining</p><ul class="small-note">${plan.operations.map(op=>`<li>${escapeHTML(op.label)}</li>`).join('')}</ul><button class="btn" data-action="backup-apply" ${plan.operations.length?disabled:'disabled'}>Apply reviewed changes</button><button class="btn subtle" data-action="backup-cancel" ${disabled}>Close import preview</button>`:'');
+    }
+    async applyBackup(){
+        const plan=this.importPlan;if(!plan||this.saving)return;
+        this.saving=true;this.render();
+        const same=(a,b)=>JSON.stringify(a)===JSON.stringify(b);
+        try{
+            if(plan.device!==(this.fp?.ieee??this.device))throw new Error('Selected FP400 changed. Preview the backup again.');
+            while(plan.operations.length){
+                const op=plan.operations[0],current=this.configurationSnapshot().configuration[op.section][op.key];
+                const native=op.section==='native_zones',ready=()=>!native||this.state('sensor',`native_zone_${op.key}_status`)==='ready';
+                if(same(current,op.after)&&ready()){plan.operations.shift();plan.completed++;continue;}
+                if(!op.created&&!same(current,op.before))throw new Error(`${op.label}: state changed since preview. Preview again before continuing.`);
+                if(op.created){const id=/^zone_([1-8])_/.exec(op.key)[1];if(!same(this.configurationSnapshot().configuration.native_zones[id],op.parentConfig)||this.state('sensor',`native_zone_${id}_status`)!=='ready')throw new Error(`Sensor zone ${id} creation was not confirmed.`);}
+                this.notice(`Importing ${op.label}…`);
+                if(native&&current&&this.state('binary_sensor',`native_zone_${op.key}_owned`)==='off')throw new Error(`Sensor zone ${op.key} requires explicit takeover.`);
+                if(op.section==='settings'){
+                    const zone=/^zone_([1-8])_/.exec(op.key);if(zone&&this.state('binary_sensor',`native_zone_${zone[1]}_owned`)==='off')throw new Error(`Sensor zone ${zone[1]} requires explicit takeover.`);
+                    const [domain]=backupSettings().find(([,key])=>key===op.key),data={entity_id:this.entity(domain,op.key)};
+                    const service=domain==='switch'?op.after==='on'?'turn_on':'turn_off':domain==='select'?'select_option':'set_value';
+                    if(domain==='number')data.value=op.after;else if(domain==='select')data.option=op.after;
+                    await this._hass.callService(domain,service,data);
+                }else if(op.section==='areas'){
+                    // One contiguous row at a time: existing converter commands confirm each mask write.
+                    const target=maskBits(op.after),have=maskBits(current);
+                    for(const add of [false,true])for(let row=0;row<20;row++)for(let col=0;col<16;col++){
+                        let bit=row*16+col;if(have.has(bit)===target.has(bit)||target.has(bit)!==add)continue;
+                        const first=col;while(col+1<16&&have.has(bit+1)!==target.has(bit+1)&&target.has(bit+1)===add){col++;bit++;}
+                        const rect={x_min:350-col*50,x_max:400-first*50,y_min:row*50,y_max:(row+1)*50};
+                        await this._hass.callService('text','set_value',{entity_id:this.entity('text',`${op.key}_zone_${add?'add':'remove'}`),value:JSON.stringify(rect)});
+                        for(const b of rectBits(rect))add?have.add(b):have.delete(b);
+                        const expected=maskHex(have);await this.waitUntil(()=>this.areaMask(op.key)===expected,`Area ${op.key} import was not confirmed.`);
+                        op.before=expected;
+                    }
+                }else await this._hass.callService('text','set_value',{entity_id:this.entity('text',`${native?'native':'software'}_zone_${op.key}_config`),value:op.after?JSON.stringify(op.after):'clear'});
+                await this.waitUntil(()=>same(this.configurationSnapshot().configuration[op.section][op.key],op.after)&&ready(),`${op.label} was not confirmed. Remaining changes are kept.`,native?45000:15000);
+                plan.operations.shift();plan.completed++;
+            }
+            this.notice(`Import confirmed: ${plan.completed} changes.`,'success');
+        }catch(error){this.notice(`${plan.completed} changes confirmed. ${error.message}`,'error');}
+        finally{this.saving=false;this.render();}
+    }
     inside(selector){return this.shadowRoot.querySelector(selector).contains(this.shadowRoot.activeElement);}
     mount(){
         this.shadowRoot.innerHTML=`<style>${STYLE}</style><ha-card>
@@ -371,8 +523,8 @@ export class FP400ZoneCard extends (globalThis.HTMLElement ?? class {}) {
         this.mounted=true;this.svg=this.shadowRoot.querySelector('svg');
         this.shadowRoot.addEventListener('click',e=>{const b=e.target.closest('[data-action]');if(b&&!b.disabled)this.action(b.dataset.action,b);const row=e.target.closest('[data-zone]');if(row&&!this.saving){this.selected=Number(row.dataset.zone);this.target=null;this.mode='select';this.render();}});
         this.shadowRoot.querySelector('#snap').addEventListener('change',e=>{this.snap=Number(e.target.value);});
-        this.shadowRoot.querySelector('#inspector').addEventListener('change',e=>{if(e.target.dataset.overwrite){const id=Number(e.target.dataset.overwrite);e.target.checked?this.overwriteNative.add(id):this.overwriteNative.delete(id);this.renderButtons();}else if(e.target.dataset.nativeTimeout){const id=Number(e.target.dataset.nativeTimeout);this.applySetting(e.target,['number',`zone_${id}_absence_timeout`,`Zone ${id} empty delay`,{unit:'s',min:0}]);}else this.editField(e);});
-        this.shadowRoot.querySelector('#settings').addEventListener('change',e=>this.applySetting(e.target));
+        this.shadowRoot.querySelector('#inspector').addEventListener('change',e=>{if(e.target.dataset.overwrite){const id=Number(e.target.dataset.overwrite);e.target.checked?this.overwriteNative.add(id):this.overwriteNative.delete(id);this.renderButtons();}else if(e.target.dataset.nativeSensitivity){const id=Number(e.target.dataset.nativeSensitivity);this.applySetting(e.target,['select',`zone_${id}_sensitivity`,`Zone ${id} sensitivity`,{low:'Low',medium:'Medium',high:'High'}]);}else if(e.target.dataset.nativeTimeout){const id=Number(e.target.dataset.nativeTimeout);this.applySetting(e.target,['number',`zone_${id}_absence_timeout`,`Zone ${id} empty delay`,{unit:'s',min:0}]);}else this.editField(e);});
+        this.shadowRoot.querySelector('#settings').addEventListener('change',e=>{if(e.target.hasAttribute('data-backup-file'))void this.previewBackupFile(e.target.files?.[0]);else this.applySetting(e.target);});
         this.svg.addEventListener('pointerdown',e=>this.pointerDown(e));this.svg.addEventListener('pointermove',e=>this.pointerMove(e));this.svg.addEventListener('pointerup',e=>this.pointerEnd(e));this.svg.addEventListener('pointercancel',e=>this.pointerEnd(e,true));this.svg.addEventListener('lostpointercapture',e=>this.pointerEnd(e,true));
         this.svg.addEventListener('wheel',e=>this.wheel(e),{passive:false});
         this.shadowRoot.addEventListener('keydown',e=>this.keyDown(e));
@@ -411,19 +563,23 @@ export class FP400ZoneCard extends (globalThis.HTMLElement ?? class {}) {
         const areas=Object.keys(AREAS).map(t=>`${this.areaMask(t)}${this.areaReady(t)}${this.available('text',`${t}_zone_remove`)}`).join();
         if(areas!==this.lastAreas){this.lastAreas=areas;changed=true;}
         // The result time comes from the server's clock, so watch for it to change rather than comparing clocks.
-        if(this.learnBefore!==undefined&&this.trackingValue('learning_result_time')!==this.learnBefore){this.learnBefore=undefined;this.notice('Room learning finished.','success');}
+        this.checkLearningResult();
         if(!this.drag){if(changed)this.renderList();if((changed||this.native)&&!this.inside('#inspector'))this.renderInspector();}
         if(this.native&&!this.hasNativeControls())this.notice('Native zone controls are unavailable. Enable native_zones in Zigbee2MQTT, or discard edits to return to software zones.','error');
         if(this.panel==='settings'&&!this.inside('#settings'))this.renderSettings();
         this.renderMap();this.renderLive();this.renderButtons();
     }
-    targets(){return parseTargets(this.trackingValue('targets_xy'));}
+    targets(){const detailed=observedTargets(this.trackingValue('tracking_targets'));return detailed??parseTargets(this.trackingValue('targets_xy'));}
     fresh(){const time=Date.parse(this.trackingValue('tracking_last_update'));return ['valid','partial'].includes(this.trackingValue('tracking_status')) && Number.isFinite(time) && Date.now()-time<30000;}
     // A zone shows a state whenever the converter has one (fresh positions, or held by the sensor's own presence).
     zoneLive(id){return this.native?this.nativeStatus(id)==='ready'&&['on','off'].includes(this.state('binary_sensor',this.zoneKey(id,'occupancy'))):this.state('binary_sensor',`software_zone_${id}_available`)==='on';}
     notice(text,type=''){if(!this.mounted)return;const el=this.shadowRoot.querySelector('#message');el.textContent=text;el.className=`message ${type}`;}
     mark(id,z){if(!this.dirty.has(id))this.base[id]=clone(this.saved[id]);this.drafts[id]=z;if(this.same(z,this.saved[id])){this.dirty.delete(id);delete this.base[id];}else this.dirty.add(id);this.notice(this.dirty.size?`${this.dirty.size} zone${this.dirty.size===1?'':'s'} with unsaved changes.`:'All changes are saved.');}
     action(action,el){
+        if(action==='backup-export'){this.downloadBackup();return;}
+        if(action==='backup-apply'){void this.applyBackup();return;}
+        if(action==='backup-cancel'){this.importPlan=null;this.renderSettings();return;}
+        if(action==='adopt-native'){void this.adoptNative(this.selected);return;}
         if(action==='zone-mode'){this.switchZones();return;}
         if(action==='settings'){this.panel=this.panel==='settings'?'zones':'settings';this.render();return;}
         if(action==='learn'){this.learn();return;}
@@ -733,11 +889,14 @@ export class FP400ZoneCard extends (globalThis.HTMLElement ?? class {}) {
         const input=(label,key,value,type='number',extra='')=>`<label class="field">${label}<input data-field="${key}" data-for="${id}" type="${type}" value="${escapeHTML(value)}" ${extra} ${off}/></label>`;
         const error=this.state('sensor',`native_zone_${id}_error`);
         const timeoutId=this.entity('number',`zone_${id}_absence_timeout`),timeout=this._hass?.states?.[timeoutId],ready=this.nativeTimeoutReady(id);
+        const sensitivityField=this.settingRow('select',`zone_${id}_sensitivity`,'Sensitivity',{low:'Low',medium:'Medium',high:'High'}).replace('data-setting=',`data-native-sensitivity="${id}" ${this.nativeSettingReady(id,'sensitivity')?'':'disabled'} data-setting=`);
+        const reporting=this.trackingValue(`native_zone_${id}_reporting`),delivery=reporting==='polled'?'Presence is checked periodically.':reporting==='reported'?'Presence changes are reported by the sensor.':'';
         const timeoutField=`<label class="field">Empty delay · seconds<input data-setting="${timeoutId}" data-native-timeout="${id}" type="number" min="0" max="${timeout?.attributes?.max??300}" step="1" value="${ready?escapeHTML(timeout.state):''}" ${ready&&!this.busy[timeoutId]?'':'disabled'}/></label><p class="small-note">${ready?'Applies immediately to this sensor zone.':'Available after this zone is saved and the sensor is ready.'}</p>`;
         setHtml(el,`<h2 class="section-title">SENSOR ZONE ${id?`<span class="count-pill">${id}</span>`:''}</h2>`+
-            (z?`${unknown?'<p class="small-note">The sensor geometry for this slot is not confirmed. Paint a replacement only if you intend to write this slot.</p>':`${input('Name','name',z.name,'text','maxlength="32"')}${timeoutField}<p class="small-note">${maskBits(z.mask_hex).size} cells · 0.5 m grid.</p>`}<div class="segmented"><button class="btn" data-action="native-paint" data-tool="add" ${off}>Paint</button><button class="btn" data-action="native-paint" data-tool="remove" ${unknown?'disabled':off}>Erase</button></div><button class="btn danger" data-action="delete" ${off}>Delete zone</button>`
+            (z?`${unknown?'<p class="small-note">The sensor geometry for this slot is not confirmed. Paint a replacement only if you intend to write this slot.</p>':`${input('Name','name',z.name,'text','maxlength="32"')}${timeoutField}${sensitivityField}<p class="small-note">${delivery} Geometry: ${escapeHTML(this.trackingValue(`native_zone_${id}_source`)??'acknowledged')}.</p><p class="small-note">${maskBits(z.mask_hex).size} cells · 0.5 m grid.</p>`}<div class="segmented"><button class="btn" data-action="native-paint" data-tool="add" ${off}>Paint</button><button class="btn" data-action="native-paint" data-tool="remove" ${unknown?'disabled':off}>Erase</button></div><button class="btn danger" data-action="delete" ${off}>Delete zone</button>`
             :`<p class="small-note">${id&&this.dirty.has(id)?'This zone will be removed when you save.':'Draw a sensor zone, or select one to paint or erase 0.5 m cells. Software zones stay separate.'}</p>`)+
             (overwrite?`<label class="small-note"><input type="checkbox" data-overwrite="${id}" ${this.overwriteNative.has(id)?'checked':''} ${this.saving?'disabled':''}/> I confirm writing or deleting sensor zone ${id}.</label>`:'')+
+            (overwrite&&z&&z!=='unmanaged'?`<button class="btn" data-action="adopt-native" ${this.saving?'disabled':''}>Use this existing geometry</button>`:'')+
             (this.nativeStatus(id)==='error'&&error?`<p class="message error">${escapeHTML(error)}</p>`:'')+this.areasSummary());
     }
     areasPanel(){
@@ -758,19 +917,20 @@ export class FP400ZoneCard extends (globalThis.HTMLElement ?? class {}) {
     }
     targetPanel(){
         const id=this.target,seen=this.fresh()&&this.targets().some(t=>t.id===id),off=this.saving?'disabled':'';
-        return `<h2 class="section-title">TARGET <span class="count-pill">${id+1}</span></h2><p class="small-note">${seen?'The sensor sees something here right now.':'The sensor does not see this target right now.'} Not a person? Make the sensor forget it. If it keeps coming back in the same spot, ignore that spot.</p><button class="btn" data-action="forget-target" ${this.forgetting!==null||!this.available('text','remove_target')?'disabled':off}>${this.forgetting!==null?'Forgetting…':'Forget this target'}</button><button class="btn" data-action="ignore-target" ${this.targetAt&&this.areaReady('interference')?off:'disabled'}>Ignore this spot</button><button class="btn subtle" data-action="close-target">Done</button>`;
+        const target=this.targets().find(t=>t.id===id),details=seen&&target?`Observed X ${target.x} cm, Y ${target.y} cm. Activity: ${target.activity===1?'active':target.activity===2?'still':'unknown'}.`:'';
+        return `<h2 class="section-title">TARGET <span class="count-pill">${id+1}</span></h2><p class="small-note">${seen?'The sensor sees something here right now.':'The sensor does not see this target right now.'} ${details} Track IDs are temporary. Not a person? Make the sensor forget it. If it keeps coming back in the same spot, ignore that spot.</p><button class="btn" data-action="forget-target" ${this.forgetting!==null||!this.available('text','remove_target')?'disabled':off}>${this.forgetting!==null?'Forgetting…':'Forget this target'}</button><button class="btn" data-action="ignore-target" ${this.targetAt&&this.areaReady('interference')?off:'disabled'}>Ignore this spot</button><button class="btn subtle" data-action="close-target">Done</button>`;
     }
     renderSettings(){
         if(!this.mounted||this.panel!=='settings')return;
         const groups=SETTINGS.map(([title,items])=>{const rows=items.map(item=>this.settingRow(...item)).join('');return rows?`<h2 class="section-title">${title.toUpperCase()}</h2>${rows}`:'';}).join('');
         const learned=Date.parse(this.trackingValue('learning_result_time')),room=[];
-        if(this.available('button','spatial_learning'))room.push(`<button class="btn" data-action="learn">${this.learnArmed?'Room empty? Press again to start':'Learn the empty room'}</button><p class="small-note">Teaches the sensor what your empty room looks like. ${Number.isFinite(learned)?`Last done ${new Date(learned).toLocaleString()}.`:''}</p>`);
+        if(this.available('button','spatial_learning'))room.push(`<button class="btn" data-action="learn">${this.learnArmed?'Room empty? Press again to start':'Learn the empty room'}</button><p class="small-note">Teaches the sensor what your empty room looks like. ${Number.isFinite(learned)?`Last result ${new Date(learned).toLocaleString()}.`:''}</p>`);
         if(this.available('button','refresh_configuration'))room.push(`<button class="btn" data-action="refresh">Read settings from the sensor</button>`);
-        setHtml(this.shadowRoot.querySelector('#settings'),`<div class="settings-head"><h2 class="section-title">SENSOR SETTINGS</h2><button class="btn icon" data-action="settings" aria-label="Close settings">✕</button></div>${groups||'<div class="empty">No settings found. Update the FP400 converter in Zigbee2MQTT.</div>'}${room.length?`<h2 class="section-title">ROOM</h2>${room.join('')}`:''}<p class="small-note">Changes apply right away.</p>`);
+        setHtml(this.shadowRoot.querySelector('#settings'),`<div class="settings-head"><h2 class="section-title">SENSOR SETTINGS</h2><button class="btn icon" data-action="settings" aria-label="Close settings">✕</button></div>${groups||'<div class="empty">No settings found. Update the FP400 converter in Zigbee2MQTT.</div>'}${room.length?`<h2 class="section-title">ROOM</h2>${room.join('')}`:''}${this.backupPanel()}<p class="small-note">Changes apply right away.</p>`);
     }
     settingRow(domain,key,label,extra){
         const id=this.entity(domain,key),s=this._hass?.states?.[id];if(!s)return '';
-        const attrs=`data-setting="${id}" aria-label="${label}" ${s.state==='unavailable'||this.busy[id]?'disabled':''}`;
+        const attrs=`data-setting="${id}" aria-label="${label}" ${s.state==='unavailable'||this.busy[id]||this.saving?'disabled':''}`;
         if(domain==='switch')return `<label class="setting toggle"><span>${label}</span><input type="checkbox" role="switch" ${attrs} ${s.state==='on'?'checked':''}></label>`;
         if(domain==='select'){
             const values=(s.attributes?.options??Object.keys(extra)).filter(v=>v in extra);
@@ -782,8 +942,8 @@ export class FP400ZoneCard extends (globalThis.HTMLElement ?? class {}) {
     // Settings apply at once and count as done only when the sensor's reported state matches.
     async applySetting(input,descriptor){
         const id=input.dataset.setting;if(!id||this.busy[id])return;
-        const [domain,object]=id.split('.'),item=descriptor??SETTINGS.flatMap(([,items])=>items).find(([d,k])=>d===domain&&object===`${this.device}_${k}`);if(!item)return;
-        const nativeId=Number(input.dataset.nativeTimeout);if(nativeId&&(!this.nativeTimeoutReady(nativeId)||id!==this.entity('number',`zone_${nativeId}_absence_timeout`)))return;
+        const [domain]=id.split('.'),item=descriptor??SETTINGS.flatMap(([,items])=>items).find(([d,k])=>d===domain&&this.entity(d,k)===id);if(!item)return;
+        const nativeId=Number(input.dataset.nativeTimeout??input.dataset.nativeSensitivity),nativeKey=input.dataset.nativeSensitivity?'sensitivity':'absence_timeout';if(nativeId&&(!this.nativeSettingReady(nativeId,nativeKey)||id!==this.entity(nativeKey==='sensitivity'?'select':'number',`zone_${nativeId}_${nativeKey}`)))return;
         const [, ,label,extra]=item,a=this._hass.states[id]?.attributes??{},data={entity_id:id};let service,expected;
         try{
             if(domain==='switch'){service=input.checked?'turn_on':'turn_off';expected=input.checked?'on':'off';}
@@ -805,12 +965,41 @@ export class FP400ZoneCard extends (globalThis.HTMLElement ?? class {}) {
         catch(error){this.notice(error?.message??String(error),'error');return false;}
     }
     // Learning needs an empty room, so the first press only asks.
+    checkLearningResult(){
+        const time=this.trackingValue('learning_result_time');
+        if(this.learnBefore===undefined||typeof time!=='string'||!time.endsWith('Z')||!Number.isFinite(Date.parse(time))||Date.parse(time)<=Date.parse(this.learnBefore)||this.trackingValue('learning_state')!=='result_received')return false;
+        const code=this.trackingValue('learning_result_code');
+        if(code==null||code===''||!Number.isInteger(Number(code))||Number(code)<0||Number(code)>255)return false;
+        clearTimeout(this.learnResultTimer);this.learnBefore=undefined;
+        this.notice(`Room learning result received (code ${Number(code)}). The code's meaning has not been verified.`);
+        const areas=this.learnAreasBefore;this.learnAreasBefore=undefined;
+        if(areas)void this.readLearningAreas(Number(code),areas);
+        return true;
+    }
+    async readLearningAreas(code,before){
+        const device=this.device,previous=this.trackingValue('areas_read_time'),prefix=`Room learning result received (code ${code}).`;
+        try{
+            await this._hass.callService('button','press',{entity_id:this.entity('button','refresh_configuration')});
+            await this.waitUntil(()=>{const now=this.trackingValue('areas_read_time');return typeof now==='string'&&now!==previous&&Number.isFinite(Date.parse(now))&&Object.keys(AREAS).every(type=>maskBits(this.areaMask(type))!==null);},'Area readback was not confirmed.');
+            if(device!==this.device)return;
+            const changes=Object.keys(AREAS).map(type=>{const old=maskBits(before[type]),now=maskBits(this.areaMask(type));return old?`${type}: +${[...now].filter(i=>!old.has(i)).length}/−${[...old].filter(i=>!now.has(i)).length} cells`:`${type}: ${now.size} cells (previous value unavailable)`;});
+            this.notice(`${prefix} Areas read: ${changes.join('; ')}. The result code's meaning remains unverified.`);
+        }catch(error){if(device===this.device)this.notice(`${prefix} ${error.message} The previous areas are retained.`, 'error');}
+    }
     async learn(){
+        if(this.learnBefore!==undefined)return;
+        if(this.saving||this.dirty?.size||this.pendingAreas?.length||this.pendingClears?.size){this.notice('Save or discard edits before learning the room.','error');return;}
         clearTimeout(this.learnTimer);
-        if(!this.learnArmed){this.learnArmed=true;this.learnTimer=setTimeout(()=>{this.learnArmed=false;this.renderSettings();},8000);this.notice('Leave the room empty, then press again. It takes about 10 seconds.');this.renderSettings();return;}
+        if(!this.learnArmed){this.learnArmed=true;this.learnTimer=setTimeout(()=>{this.learnArmed=false;this.renderSettings();},8000);this.notice('Leave the room empty, then press again. Wait for a result from the sensor.');this.renderSettings();return;}
         this.learnArmed=false;this.renderSettings();
-        const before=this.trackingValue('learning_result_time');
-        if(await this.press('spatial_learning','Learning the room. Stay out for about 10 seconds.'))this.learnBefore=before;
+        this.learnAreasBefore=this.available('button','refresh_configuration')?Object.fromEntries(Object.keys(AREAS).map(type=>[type,this.areaMask(type)])):null;
+        this.learnBefore=this.trackingValue('learning_result_time')??'';
+        try{
+            await this._hass.callService('button','press',{entity_id:this.entity('button','spatial_learning')});
+            if(this.learnBefore===undefined||this.checkLearningResult())return;
+            this.notice('Learning requested. Keep the room empty while waiting for the sensor result.');
+            this.learnResultTimer=setTimeout(()=>{this.learnBefore=undefined;this.notice('No learning result received yet. Read the sensor settings before trying again.','error');},30000);
+        }catch(error){this.learnBefore=undefined;this.notice(error?.message??String(error),'error');}
     }
     // The sensor drops the track; a real person is picked up again within seconds.
     async forgetTarget(id){
