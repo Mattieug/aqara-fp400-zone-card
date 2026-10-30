@@ -54,7 +54,7 @@ export function nativeCatalogueSensor(ieeeAddr,initial=[]){
     d.nativeZones=zones;d.nativeCommands=[];
     d.syncCatalogue=()=>{
         d.put(1,'aqaraFp400Radar',0,[...zones.values()].map(z=>z.endpoint));
-        d.put(1,'aqaraFp400Config',16,[...zones].map(([id,z])=>[id,0,Buffer.from(z.mask_hex,'hex'),1]));
+        d.put(1,'aqaraFp400Config',16,[...zones].map(([id,z])=>[id,0,Buffer.from(z.mask_hex,'hex'),z.flag??1]));
         d.put(1,'aqaraFp400Config',17,8);
         for(const [id,z] of zones){
             d.put(z.endpoint,'aqaraFp400Radar',1,id);d.put(z.endpoint,'aqaraFp400Radar','humanCount',0);
@@ -71,7 +71,7 @@ export function nativeCatalogueSensor(ieeeAddr,initial=[]){
                 d.nativeCommands.push({name,args});
                 const zone=args.zone?.[0].elmVal??args.zoneId;
                 if(name==='removeZone')zones.delete(zone);
-                else zones.set(zone,{endpoint:zones.get(zone)?.endpoint??zone+12,mask_hex:args.zone[2].elmVal.toString('hex')});
+                else zones.set(zone,{endpoint:zones.get(zone)?.endpoint??zone+12,mask_hex:args.zone[2].elmVal.toString('hex'),flag:args.zone[3].elmVal});
                 d.syncCatalogue();return {errorCode:0};
             };
         }

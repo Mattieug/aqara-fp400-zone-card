@@ -856,7 +856,11 @@ const fp400NativeControl = {
                     const maximum = (await device.getEndpoint(1).read(configCluster, [17], manufacturerOptions))[17];
                     if (!Number.isInteger(maximum) || maximum < 1 || endpoints.size >= maximum) throw new Error('Native zone capacity is unavailable or full');
                 }
-                const record = {config, status: 'pending', error: '', ...(config && previous?.settleUntil ? {settleUntil: previous.settleUntil} : {})};
+                // Preserve the opaque native boolean when taking over an observed zone.
+                // Its physical meaning is not established; editing geometry must not toggle it.
+                const observedFlag=context.catalogue?.get(id)?.flag??previous?.wireFlag;
+                const wireFlag=[0,1].includes(observedFlag)?observedFlag:1;
+                const record = {config, ...(config?{wireFlag}:{}), status: 'pending', error: '', ...(config && previous?.settleUntil ? {settleUntil: previous.settleUntil} : {})};
                 device.meta.fp400NativeZones = {...device.meta.fp400NativeZones, [id]: record}; changed = true;
                 await device.save();
                 delete context.readings[id];
@@ -864,7 +868,7 @@ const fp400NativeControl = {
                 if (config || endpoint !== undefined) {
                     const command = config ? append ? 'appendZone' : 'updateZone' : 'removeZone';
                     const args = config ? {zone: [{elmType: 0x20, elmVal: id}, {elmType: 0x30, elmVal: 0},
-                        {elmType: 0x41, elmVal: Buffer.from(config.mask_hex, 'hex')}, {elmType: 0x10, elmVal: 1}]} : {zoneId: id};
+                        {elmType: 0x41, elmVal: Buffer.from(config.mask_hex, 'hex')}, {elmType: 0x10, elmVal: wireFlag}]} : {zoneId: id};
                     const result = await device.getEndpoint(1).command(configCluster, command, args, {...manufacturerOptions, disableDefaultResponse: false, disableResponse: false});
                     if (result?.errorCode !== 0) throw new Error(`Native ${command} was not acknowledged: ${JSON.stringify(result)}`);
                 }

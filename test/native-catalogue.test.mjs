@@ -32,6 +32,16 @@ test('external modification of an owned ID requires explicit takeover',async()=>
     await control.convertSet(null,'native_zone_1_config',{...config,overwrite:true},{device:d,options,publish:()=>{}});
     assert.equal(d.nativeCommands.length,1);assert.equal(nativeZoneState(d).native_zone_1_source,'acknowledged');
 });
+test('adopting and editing geometry preserve an observed opaque boolean without inventing an enable control',async()=>{
+    const d=nativeCatalogueSensor('catalogue-opaque-flag',[[1,{endpoint:17,mask_hex:mask,flag:0}]]);
+    await fp400Poll(d,{...options,restore_native_zones:false});
+    const control=definition.toZigbee.find(c=>c.key.includes('native_zone_1_config'));
+    await control.convertSet(null,'native_zone_1_config',{...config,overwrite:true},{device:d,options,publish:()=>{}});
+    assert.equal(d.nativeCommands.at(-1).args.zone[3].elmVal,0);
+    assert.equal(d.meta.fp400NativeZones[1].wireFlag,0);
+    await control.convertSet(null,'native_zone_1_config',{...config,mask_hex:other},{device:d,options,publish:()=>{}});
+    assert.equal(d.nativeCommands.at(-1).args.zone[3].elmVal,0,'local confirmation preserves the value after the observation is invalidated');
+});
 test('opt-in recovery requires two complete matching reads and ignores deleted or uncertain zones',async(t)=>{
     let now=1e12;t.mock.method(Date,'now',()=>now);
     const d=nativeCatalogueSensor('catalogue-restore');
