@@ -35,6 +35,57 @@ const SETTINGS = [
 ];
 // What the card names a zone's entities in Home Assistant, e.g. "Desk occupancy".
 const ENTITY_NAMES = [['binary_sensor','occupancy','occupancy','occupancy'],['binary_sensor','available','tracking available'],['text','config','zone configuration'],['sensor','count','people'],['sensor','activity','activity']];
+const backupSettings=()=>[...SETTINGS.flatMap(([,items])=>items),...Array.from({length:8},(_,i)=>[
+    ['number',`zone_${i+1}_absence_timeout`,`Sensor zone ${i+1} empty delay`,{min:0,max:300}],
+    ['select',`zone_${i+1}_sensitivity`,`Sensor zone ${i+1} sensitivity`,{low:'Low',medium:'Medium',high:'High'}],
+]).flat()];
+const unknownState=value=>[undefined,null,'','unknown','unavailable'].includes(value);
+function backupSettingValue(key,value){
+    const item=backupSettings().find(([,k])=>k===key);if(!item)throw new Error(`Unsupported backup setting: ${key}`);
+    const [domain,,,extra]=item;
+    if(domain==='switch'){if(!['on','off'].includes(value))throw new Error(`Invalid ${key}`);return value;}
+    if(domain==='select'){if(!Object.hasOwn(extra,value))throw new Error(`Invalid ${key}`);return value;}
+    const [min,max]=key==='installation_height'?[1,65535]:key==='map_rotation'?[-180,180]:key==='forget_still_targets'?[0,240]:[0,300];
+    if(typeof value!=='number'||!Number.isFinite(value)||value<min||value>max||(key!=='map_rotation'&&!Number.isInteger(value)))throw new Error(`Invalid ${key}`);
+    return value;
+}
+export function normalizeBackup(input){
+    const value=typeof input==='string'?JSON.parse(input):input;
+    if(!value||value.format!=='aqara-fp400'||value.version!==1)throw new Error('Unsupported FP400 backup format or version');
+    const configuration={settings:{},areas:{},software_zones:{},native_zones:{}};
+    const source=value.configuration;if(!source||typeof source!=='object'||Array.isArray(source))throw new Error('Backup configuration is missing');
+    for(const key of Object.keys(source))if(!Object.hasOwn(configuration,key))throw new Error(`Unknown backup section: ${key}`);
+    for(const [section,entries] of Object.entries(configuration)){
+        const supplied=source[section]??{};if(!supplied||typeof supplied!=='object'||Array.isArray(supplied))throw new Error(`Invalid ${section}`);
+        for(const [key,v] of Object.entries(supplied)){
+            if(section==='settings')entries[key]=backupSettingValue(key,v);
+            else if(section==='areas'){if(!Object.hasOwn(AREAS,key)||!maskBits(v))throw new Error(`Invalid area ${key}`);entries[key]=v.toLowerCase();}
+            else {
+                if(!/^[1-8]$/.test(key))throw new Error('Zone IDs must be 1..8');
+                const z=section==='native_zones'?normalizeNativeZone(v):normalizeZone(v);
+                if(z==='unmanaged')throw new Error('Uncertain native geometry cannot be imported');entries[key]=z;
+            }
+        }
+    }
+    return {format:'aqara-fp400',version:1,device:typeof value.device==='string'?value.device:null,configuration};
+}
+export function planBackupImport(backup,current){
+    const wanted=normalizeBackup(backup).configuration,operations=[];
+    for(const section of ['settings','software_zones','native_zones','areas'])for(const [key,after] of Object.entries(wanted[section])){
+        const before=current[section]?.[key],creatingSetting=/^zone_([1-8])_/.exec(key);
+        const created=section==='settings'&&creatingSetting&&current.native_zones?.[creatingSetting[1]]===null&&wanted.native_zones[creatingSetting[1]];
+        if(before===undefined&&!created)throw new Error(`${section} ${key} is unavailable. Read it from the sensor before importing.`);
+        if(JSON.stringify(before)===JSON.stringify(after))continue;
+        let label;
+        if(section==='settings')label=`${backupSettings().find(([,k])=>k===key)[2]}: ${before??'new zone'} → ${after}`;
+        else if(section==='areas'){
+            const a=maskBits(before),b=maskBits(after);label=`${AREAS[key].label}: ${[...b].filter(x=>!a.has(x)).length} cells added, ${[...a].filter(x=>!b.has(x)).length} removed`;
+        }else label=`${section==='native_zones'?'Sensor':'Software'} zone ${key}: ${after?after.name:'delete'}`;
+        const rank=section==='settings'?/^zone_/.test(key)?4:['installation_mode','side_installation','installation_height','coordinate_reverse'].includes(key)?0:1:section==='areas'?2:3;
+        operations.push({section,key,before,after,label,rank,created:Boolean(created),...(created?{parentConfig:wanted.native_zones[creatingSetting[1]]}:{})});
+    }
+    return operations.sort((a,b)=>a.rank-b.rank);
+}
 const escapeHTML = value => String(value).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const clone = value => value == null ? null : typeof value==='string' ? value : {...value};
 const clamp = (v,a,b) => Math.max(a,Math.min(b,v));
@@ -378,6 +429,86 @@ export class FP400ZoneCard extends (globalThis.HTMLElement ?? class {}) {
     entity(domain,key){return this.fp?.keys?.[`${domain}.${key}`]??`${domain}.${this.device}_${key}`;}
     state(domain,key){return this._hass?.states?.[this.entity(domain,key)]?.state;}
     available(domain,key){return !['unavailable',undefined].includes(this.state(domain,key));}
+    configurationSnapshot(){
+        const configuration={settings:{},areas:{},software_zones:{},native_zones:{}},unavailable=[];
+        for(const [domain,key] of backupSettings()){
+            const raw=this.state(domain,key);if(unknownState(raw)){unavailable.push(key);continue;}
+            try{configuration.settings[key]=backupSettingValue(key,domain==='number'?Number(raw):raw);}catch{unavailable.push(key);}
+        }
+        for(const type of Object.keys(AREAS)){
+            const value=this.areaMask(type);if(maskBits(value))configuration.areas[type]=value;else unavailable.push(`${type}_mask_hex`);
+        }
+        for(const mode of ['software','native'])for(let id=1;id<=8;id++){
+            const raw=this.state('text',`${mode}_zone_${id}_config`);if(unknownState(raw)||raw==='unmanaged'||(mode==='native'&&this.state('sensor',`native_zone_${id}_status`)!=='ready')){unavailable.push(`${mode}_zone_${id}`);continue;}
+            try{configuration[`${mode}_zones`][id]=mode==='native'?normalizeNativeZone(raw):normalizeZone(raw);}catch{unavailable.push(`${mode}_zone_${id}`);}
+        }
+        for(const key of Object.keys(configuration.settings)){const zone=/^zone_([1-8])_/.exec(key);if(zone&&!configuration.native_zones[zone[1]]){delete configuration.settings[key];unavailable.push(key);}}
+        return {configuration,unavailable};
+    }
+    configurationBackup(){return {format:'aqara-fp400',version:1,card_version:VERSION,created_at:new Date().toISOString(),device:this.fp?.ieee??this.device,...this.configurationSnapshot()};}
+    downloadBackup(){
+        const url=URL.createObjectURL(new Blob([JSON.stringify(this.configurationBackup(),null,2)],{type:'application/json'})),link=document.createElement('a');
+        link.href=url;link.download=`fp400-${new Date().toISOString().slice(0,10)}.json`;link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
+        this.notice('Downloaded known configuration. Unavailable fields are listed in the file and are never treated as deleted.');
+    }
+    async previewBackupFile(file){
+        if(!file||this.saving)return;
+        try{
+            if(file.size>262144)throw new Error('Backup file exceeds 256 KiB');
+            if(this.dirty.size||this.pendingAreas.length||this.pendingClears.size)throw new Error('Save or discard your edits before importing.');
+            const backup=normalizeBackup(await file.text()),device=this.fp?.ieee??this.device;
+            if(/^0x[0-9a-f]{16}$/i.test(device)&&/^0x[0-9a-f]{16}$/i.test(backup.device)&&device!==backup.device)throw new Error('This backup belongs to a different FP400. Select its card first.');
+            const operations=planBackupImport(backup,this.configurationSnapshot().configuration);
+            for(const op of operations){const id=op.section==='native_zones'?op.key:op.section==='settings'?/^zone_([1-8])_/.exec(op.key)?.[1]:null;if(id&&this.state('text',`native_zone_${id}_config`)!=='clear'&&this.state('binary_sensor',`native_zone_${id}_owned`)==='off')throw new Error(`Adopt sensor zone ${id} explicitly before importing into it.`);}
+            this.importPlan={device,operations,completed:0};this.notice(operations.length?`${operations.length} configuration changes ready for review.`:'Backup already matches the known configuration.');
+        }catch(error){this.importPlan=null;this.notice(error.message,'error');}
+        this.renderSettings();
+    }
+    backupPanel(){
+        const plan=this.importPlan,disabled=this.saving?'disabled':'';
+        return `<h2 class="section-title">CONFIGURATION BACKUP</h2><button class="btn" data-action="backup-export" ${disabled}>Download known configuration</button><label class="field">Preview a backup<input type="file" accept=".json,application/json" data-backup-file ${disabled}/></label>`+
+            (plan?`<p class="small-note">${plan.completed} confirmed · ${plan.operations.length} remaining</p><ul class="small-note">${plan.operations.map(op=>`<li>${escapeHTML(op.label)}</li>`).join('')}</ul><button class="btn" data-action="backup-apply" ${plan.operations.length?disabled:'disabled'}>Apply reviewed changes</button><button class="btn subtle" data-action="backup-cancel" ${disabled}>Close import preview</button>`:'');
+    }
+    async applyBackup(){
+        const plan=this.importPlan;if(!plan||this.saving)return;
+        this.saving=true;this.render();
+        const same=(a,b)=>JSON.stringify(a)===JSON.stringify(b);
+        try{
+            if(plan.device!==(this.fp?.ieee??this.device))throw new Error('Selected FP400 changed. Preview the backup again.');
+            while(plan.operations.length){
+                const op=plan.operations[0],current=this.configurationSnapshot().configuration[op.section][op.key];
+                const native=op.section==='native_zones',ready=()=>!native||this.state('sensor',`native_zone_${op.key}_status`)==='ready';
+                if(same(current,op.after)&&ready()){plan.operations.shift();plan.completed++;continue;}
+                if(!op.created&&!same(current,op.before))throw new Error(`${op.label}: state changed since preview. Preview again before continuing.`);
+                if(op.created){const id=/^zone_([1-8])_/.exec(op.key)[1];if(!same(this.configurationSnapshot().configuration.native_zones[id],op.parentConfig)||this.state('sensor',`native_zone_${id}_status`)!=='ready')throw new Error(`Sensor zone ${id} creation was not confirmed.`);}
+                this.notice(`Importing ${op.label}…`);
+                if(native&&current&&this.state('binary_sensor',`native_zone_${op.key}_owned`)==='off')throw new Error(`Sensor zone ${op.key} requires explicit takeover.`);
+                if(op.section==='settings'){
+                    const zone=/^zone_([1-8])_/.exec(op.key);if(zone&&this.state('binary_sensor',`native_zone_${zone[1]}_owned`)==='off')throw new Error(`Sensor zone ${zone[1]} requires explicit takeover.`);
+                    const [domain]=backupSettings().find(([,key])=>key===op.key),data={entity_id:this.entity(domain,op.key)};
+                    const service=domain==='switch'?op.after==='on'?'turn_on':'turn_off':domain==='select'?'select_option':'set_value';
+                    if(domain==='number')data.value=op.after;else if(domain==='select')data.option=op.after;
+                    await this._hass.callService(domain,service,data);
+                }else if(op.section==='areas'){
+                    // One contiguous row at a time: existing converter commands confirm each mask write.
+                    const target=maskBits(op.after),have=maskBits(current);
+                    for(const add of [false,true])for(let row=0;row<20;row++)for(let col=0;col<16;col++){
+                        let bit=row*16+col;if(have.has(bit)===target.has(bit)||target.has(bit)!==add)continue;
+                        const first=col;while(col+1<16&&have.has(bit+1)!==target.has(bit+1)&&target.has(bit+1)===add){col++;bit++;}
+                        const rect={x_min:350-col*50,x_max:400-first*50,y_min:row*50,y_max:(row+1)*50};
+                        await this._hass.callService('text','set_value',{entity_id:this.entity('text',`${op.key}_zone_${add?'add':'remove'}`),value:JSON.stringify(rect)});
+                        for(const b of rectBits(rect))add?have.add(b):have.delete(b);
+                        const expected=maskHex(have);await this.waitUntil(()=>this.areaMask(op.key)===expected,`Area ${op.key} import was not confirmed.`);
+                        op.before=expected;
+                    }
+                }else await this._hass.callService('text','set_value',{entity_id:this.entity('text',`${native?'native':'software'}_zone_${op.key}_config`),value:op.after?JSON.stringify(op.after):'clear'});
+                await this.waitUntil(()=>same(this.configurationSnapshot().configuration[op.section][op.key],op.after)&&ready(),`${op.label} was not confirmed. Remaining changes are kept.`,native?45000:15000);
+                plan.operations.shift();plan.completed++;
+            }
+            this.notice(`Import confirmed: ${plan.completed} changes.`,'success');
+        }catch(error){this.notice(`${plan.completed} changes confirmed. ${error.message}`,'error');}
+        finally{this.saving=false;this.render();}
+    }
     inside(selector){return this.shadowRoot.querySelector(selector).contains(this.shadowRoot.activeElement);}
     mount(){
         this.shadowRoot.innerHTML=`<style>${STYLE}</style><ha-card>
@@ -392,7 +523,7 @@ export class FP400ZoneCard extends (globalThis.HTMLElement ?? class {}) {
         this.shadowRoot.addEventListener('click',e=>{const b=e.target.closest('[data-action]');if(b&&!b.disabled)this.action(b.dataset.action,b);const row=e.target.closest('[data-zone]');if(row&&!this.saving){this.selected=Number(row.dataset.zone);this.target=null;this.mode='select';this.render();}});
         this.shadowRoot.querySelector('#snap').addEventListener('change',e=>{this.snap=Number(e.target.value);});
         this.shadowRoot.querySelector('#inspector').addEventListener('change',e=>{if(e.target.dataset.overwrite){const id=Number(e.target.dataset.overwrite);e.target.checked?this.overwriteNative.add(id):this.overwriteNative.delete(id);this.renderButtons();}else if(e.target.dataset.nativeSensitivity){const id=Number(e.target.dataset.nativeSensitivity);this.applySetting(e.target,['select',`zone_${id}_sensitivity`,`Zone ${id} sensitivity`,{low:'Low',medium:'Medium',high:'High'}]);}else if(e.target.dataset.nativeTimeout){const id=Number(e.target.dataset.nativeTimeout);this.applySetting(e.target,['number',`zone_${id}_absence_timeout`,`Zone ${id} empty delay`,{unit:'s',min:0}]);}else this.editField(e);});
-        this.shadowRoot.querySelector('#settings').addEventListener('change',e=>this.applySetting(e.target));
+        this.shadowRoot.querySelector('#settings').addEventListener('change',e=>{if(e.target.hasAttribute('data-backup-file'))void this.previewBackupFile(e.target.files?.[0]);else this.applySetting(e.target);});
         this.svg.addEventListener('pointerdown',e=>this.pointerDown(e));this.svg.addEventListener('pointermove',e=>this.pointerMove(e));this.svg.addEventListener('pointerup',e=>this.pointerEnd(e));this.svg.addEventListener('pointercancel',e=>this.pointerEnd(e,true));this.svg.addEventListener('lostpointercapture',e=>this.pointerEnd(e,true));
         this.svg.addEventListener('wheel',e=>this.wheel(e),{passive:false});
         this.shadowRoot.addEventListener('keydown',e=>this.keyDown(e));
@@ -444,6 +575,9 @@ export class FP400ZoneCard extends (globalThis.HTMLElement ?? class {}) {
     notice(text,type=''){if(!this.mounted)return;const el=this.shadowRoot.querySelector('#message');el.textContent=text;el.className=`message ${type}`;}
     mark(id,z){if(!this.dirty.has(id))this.base[id]=clone(this.saved[id]);this.drafts[id]=z;if(this.same(z,this.saved[id])){this.dirty.delete(id);delete this.base[id];}else this.dirty.add(id);this.notice(this.dirty.size?`${this.dirty.size} zone${this.dirty.size===1?'':'s'} with unsaved changes.`:'All changes are saved.');}
     action(action,el){
+        if(action==='backup-export'){this.downloadBackup();return;}
+        if(action==='backup-apply'){void this.applyBackup();return;}
+        if(action==='backup-cancel'){this.importPlan=null;this.renderSettings();return;}
         if(action==='adopt-native'){void this.adoptNative(this.selected);return;}
         if(action==='zone-mode'){this.switchZones();return;}
         if(action==='settings'){this.panel=this.panel==='settings'?'zones':'settings';this.render();return;}
@@ -791,11 +925,11 @@ export class FP400ZoneCard extends (globalThis.HTMLElement ?? class {}) {
         const learned=Date.parse(this.trackingValue('learning_result_time')),room=[];
         if(this.available('button','spatial_learning'))room.push(`<button class="btn" data-action="learn">${this.learnArmed?'Room empty? Press again to start':'Learn the empty room'}</button><p class="small-note">Teaches the sensor what your empty room looks like. ${Number.isFinite(learned)?`Last result ${new Date(learned).toLocaleString()}.`:''}</p>`);
         if(this.available('button','refresh_configuration'))room.push(`<button class="btn" data-action="refresh">Read settings from the sensor</button>`);
-        setHtml(this.shadowRoot.querySelector('#settings'),`<div class="settings-head"><h2 class="section-title">SENSOR SETTINGS</h2><button class="btn icon" data-action="settings" aria-label="Close settings">✕</button></div>${groups||'<div class="empty">No settings found. Update the FP400 converter in Zigbee2MQTT.</div>'}${room.length?`<h2 class="section-title">ROOM</h2>${room.join('')}`:''}<p class="small-note">Changes apply right away.</p>`);
+        setHtml(this.shadowRoot.querySelector('#settings'),`<div class="settings-head"><h2 class="section-title">SENSOR SETTINGS</h2><button class="btn icon" data-action="settings" aria-label="Close settings">✕</button></div>${groups||'<div class="empty">No settings found. Update the FP400 converter in Zigbee2MQTT.</div>'}${room.length?`<h2 class="section-title">ROOM</h2>${room.join('')}`:''}${this.backupPanel()}<p class="small-note">Changes apply right away.</p>`);
     }
     settingRow(domain,key,label,extra){
         const id=this.entity(domain,key),s=this._hass?.states?.[id];if(!s)return '';
-        const attrs=`data-setting="${id}" aria-label="${label}" ${s.state==='unavailable'||this.busy[id]?'disabled':''}`;
+        const attrs=`data-setting="${id}" aria-label="${label}" ${s.state==='unavailable'||this.busy[id]||this.saving?'disabled':''}`;
         if(domain==='switch')return `<label class="setting toggle"><span>${label}</span><input type="checkbox" role="switch" ${attrs} ${s.state==='on'?'checked':''}></label>`;
         if(domain==='select'){
             const values=(s.attributes?.options??Object.keys(extra)).filter(v=>v in extra);

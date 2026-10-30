@@ -125,6 +125,32 @@ async function nativeMode(page){
     await page.evaluate(()=>{const c=document.querySelector('fp400-zone-card');c.view={x:-400,y:-50,width:800,height:900};c.render();});
 }
 const scenarios = {
+    async BACKUP(){
+        for(const mobile of [false,true]){
+            const page=await open('?latency=30',mobile?{viewport:{width:390,height:844}}:{});
+            await btn(page,'settings').click();
+            const [download]=await Promise.all([page.waitForEvent('download'),btn(page,'backup-export').click()]);
+            const exported=JSON.parse(await readFile(await download.path(),'utf8'));
+            check('BACKUP downloaded a versioned configuration',exported.version===1&&exported.configuration.software_zones[1].name==='Desk',exported.format);
+            const configuration={settings:{absence_timeout:5},software_zones:{1:{...exported.configuration.software_zones[1],name:'Imported desk'}}};
+            await page.locator('fp400-zone-card [data-backup-file]').setInputFiles({name:'fp400.json',mimeType:'application/json',buffer:Buffer.from(JSON.stringify({format:'aqara-fp400',version:1,configuration}))});
+            await waitMessage(page,/2 configuration changes ready/);
+            check('BACKUP preview sends no commands',(await calls(page)).length===0,await calls(page));
+            await btn(page,'backup-apply').click();await waitMessage(page,/Import confirmed: 2 changes/);
+            check(`BACKUP applies settings and software zone (mobile=${mobile})`,(await calls(page)).length===2,await calls(page));
+            noErrors('BACKUP',page);await page.close();
+        }
+    },
+    async NATIVE_DETAILS(){
+        const page=await open('?native=1&external=1&latency=30');await btn(page,'zone-mode').click();
+        await page.locator('fp400-zone-card .zone-row[data-zone="1"]').click();
+        check('NATIVE_DETAILS foreign geometry requires explicit adoption',await page.locator('fp400-zone-card [data-native-sensitivity="1"]').isDisabled(),await st(page));
+        await btn(page,'adopt-native').click();check('NATIVE_DETAILS no implicit adoption',(await calls(page)).length===0,await calls(page));
+        await page.locator('fp400-zone-card [data-overwrite="1"]').check();await btn(page,'adopt-native').click();await waitMessage(page,/Existing geometry adopted/);
+        await page.locator('fp400-zone-card [data-native-sensitivity="1"]').selectOption('high');await waitMessage(page,/Saved: Zone 1 sensitivity/);
+        check('NATIVE_DETAILS polling mode is explained',/checked periodically/.test((await st(page)).inspector),await st(page));
+        noErrors('NATIVE_DETAILS',page);await page.close();
+    },
     async RENAMED() {
         for(const admin of [false,true]) {
             const page=await open(`?renamedsettings=1&latency=20${admin?'&admin=1':''}`);

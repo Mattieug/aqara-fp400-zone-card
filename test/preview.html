@@ -20,6 +20,7 @@ if(params.has('native')){
     const cells=new Uint8Array(40);for(const bit of [70,71,72,86,88,102,103,104])cells[bit>>3]|=0x80>>(bit%8);
     const mask_hex=[...cells].map(b=>b.toString(16).padStart(2,'0')).join('');
     for(let i=1;i<=8;i++){set('text',`native_zone_${i}_config`,i===1?JSON.stringify({name:'Sensor desk',mask_hex}):i===2?'unmanaged':'clear');set('sensor',`native_zone_${i}_status`,'ready');set('sensor',`native_zone_${i}_error`,'');set('binary_sensor',`native_zone_${i}_occupancy`,i===1?'on':'unknown');set('sensor',`native_zone_${i}_count`,i===1?'2':'unknown');set('number',`zone_${i}_absence_timeout`,i===1?'10':'unknown',{min:0,max:300,step:1});}
+    for(let i=1;i<=8;i++){set('select',`zone_${i}_sensitivity`,i===1?'medium':'unknown',{options:['low','medium','high']});set('binary_sensor',`native_zone_${i}_owned`,i===1&&!params.has('external')?'on':'off');set('sensor',`native_zone_${i}_source`,i===1?'observed':'unknown');set('sensor',`native_zone_${i}_reporting`,i===1?'polled':'unknown');}
 }
 for(let i=1;i<=8;i++){set('text',`software_zone_${i}_config`,'clear');set('binary_sensor',`software_zone_${i}_occupancy`,'off');set('binary_sensor',`software_zone_${i}_available`,'on');if(!old){set('sensor',`software_zone_${i}_count`,'unknown');set('sensor',`software_zone_${i}_activity`,'unknown');}}
 set('text','software_zone_1_config',JSON.stringify({name:'Desk',x_min:-115,x_max:85,y_min:-19,y_max:131,absence_timeout:3}));
@@ -83,7 +84,7 @@ const hass={states,user:{is_admin:params.has('admin')},callService:async(domain,
         set('text',key,'unmanaged');card.hass={...hass};set('sensor',`native_zone_${n}_status`,'pending');set('sensor',`native_zone_${n}_error`,'');card.hass={...hass};
         sleep(creating?sim.nativeDelay:sim.latency).then(()=>{
             if(sim.nativeFail){set('sensor',`native_zone_${n}_status`,'error');set('sensor',`native_zone_${n}_error`,sim.nativeFail);}
-            else {set('text',key,value.clear?'clear':JSON.stringify({name:value.name,mask_hex:value.mask_hex}));card.hass={...hass};if(creating||value.clear)set('number',`zone_${n}_absence_timeout`,value.clear?'unknown':'10',{min:0,max:300,step:1});set('sensor',`native_zone_${n}_status`,'ready');}
+            else {set('text',key,value.clear?'clear':JSON.stringify({name:value.name,mask_hex:value.mask_hex}));card.hass={...hass};if(creating||value.clear)set('number',`zone_${n}_absence_timeout`,value.clear?'unknown':'10',{min:0,max:300,step:1});set('sensor',`native_zone_${n}_status`,'ready');set('binary_sensor',`native_zone_${n}_owned`,value.clear?'off':'on');if(creating)set('select',`zone_${n}_sensitivity`,'medium',{options:['low','medium','high']});}
             card.hass={...hass};
         });
     }
