@@ -416,6 +416,7 @@ export class FP400ZoneCard extends (globalThis.HTMLElement ?? class {}) {
     }
     trackingValue(key){return this.liveTracking?.[key]??this.state('sensor',key);}
     liveTrackingHelp(){
+        if(this.state('text','software_zone_1_config')==='unavailable'||this.state('sensor','tracking_status')==='unavailable')return null;
         const keys=['targets_xy','tracking_last_update','tracking_status'];
         const missing=keys.filter(key=>this.state('sensor',key)===undefined);
         if(!missing.length)return null;
