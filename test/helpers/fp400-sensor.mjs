@@ -1,6 +1,7 @@
 // Deliberately model failure modes rather than the converter implementation.
 // Synthetic values, not a recording of hardware. Reporting capacity is the observed FP400 limit.
 export function fp400Sensor(ieeeAddr='simulated-fp400') {
+    const copy=v=>Buffer.isBuffer(v)?Buffer.from(v):Array.isArray(v)?v.map(copy):v&&typeof v==='object'?Object.fromEntries(Object.entries(v).map(([k,val])=>[k,copy(val)])):v;
     const factory=()=>new Map([
         ...[0,2,4,5,6,7,8,22,35,41,42,43,44,45,46,47].map(id=>[`1/aqaraFp400Config/${id}`,0]),
         ...[18,19,20].map(id=>[`1/aqaraFp400Config/${id}`,Buffer.alloc(40)]),
@@ -22,7 +23,7 @@ export function fp400Sensor(ieeeAddr='simulated-fp400') {
                         const path=`${id}/${cluster}/${a}`;d.calls.push(`read/${path}`);
                         const failure=failures.get(`read/${path}`);if(failure && failure.count-->0)throw failure.error;
                         if(!values.has(path))throw Object.assign(new Error('Unsupported attribute'),{code:0x86});
-                        const v=values.get(path);result[a]=Buffer.isBuffer(v)?Buffer.from(v):structuredClone(v);
+                        result[a]=copy(values.get(path));
                     }
                     return result;
                 },
@@ -46,4 +47,36 @@ export function fp400Sensor(ieeeAddr='simulated-fp400') {
         },
     };
     return d;
+}
+
+export function nativeCatalogueSensor(ieeeAddr,initial=[]){
+    const d=fp400Sensor(ieeeAddr),zones=new Map(initial),baseGet=d.getEndpoint,baseCut=d.powerCut;
+    d.nativeZones=zones;d.nativeCommands=[];
+    d.syncCatalogue=()=>{
+        d.put(1,'aqaraFp400Radar',0,[...zones.values()].map(z=>z.endpoint));
+        d.put(1,'aqaraFp400Config',16,[...zones].map(([id,z])=>[id,0,Buffer.from(z.mask_hex,'hex'),1]));
+        d.put(1,'aqaraFp400Config',17,8);
+        for(const [id,z] of zones){
+            d.put(z.endpoint,'aqaraFp400Radar',1,id);d.put(z.endpoint,'aqaraFp400Radar','humanCount',0);
+            d.put(z.endpoint,'msOccupancySensing','occupancy',0);d.put(z.endpoint,'msOccupancySensing',3,10);
+            d.put(z.endpoint,'msOccupancySensing',4,[{elmVal:10},{elmVal:300}]);d.put(z.endpoint,128,0,1);
+        }
+    };
+    d.getEndpoint=id=>{
+        const ep=baseGet(id);ep.binds=[{cluster:{ID:0x0406},target:{ID:1}}];
+        if(!ep.nativeCommands){
+            const command=ep.command;ep.nativeCommands=true;
+            ep.command=async(cluster,name,args)=>{
+                if(!['appendZone','updateZone','removeZone'].includes(name))return command(cluster,name,args);
+                d.nativeCommands.push({name,args});
+                const zone=args.zone?.[0].elmVal??args.zoneId;
+                if(name==='removeZone')zones.delete(zone);
+                else zones.set(zone,{endpoint:zones.get(zone)?.endpoint??zone+12,mask_hex:args.zone[2].elmVal.toString('hex')});
+                d.syncCatalogue();return {errorCode:0};
+            };
+        }
+        return ep;
+    };
+    d.powerCut=()=>{baseCut();zones.clear();d.syncCatalogue();};
+    d.syncCatalogue();return d;
 }

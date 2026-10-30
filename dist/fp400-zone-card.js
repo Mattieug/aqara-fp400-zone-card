@@ -249,8 +249,20 @@ export class FP400ZoneCard extends (globalThis.HTMLElement ?? class {}) {
     zoneKey(id,suffix){return `${this.native?'native':'software'}_zone_${id}_${suffix}`;}
     normalize(value){return this.native?normalizeNativeZone(value):normalizeZone(value);}
     same(a,b){return this.native?JSON.stringify(normalizeNativeZone(a))===JSON.stringify(normalizeNativeZone(b)):sameZone(a,b);}
-    nativeOverwrite(id){return this.base[id]==='unmanaged'||this.saved[id]==='unmanaged'||this.state('text',`native_zone_${id}_config`)==='unmanaged';}
+    nativeOverwrite(id){return this.base[id]==='unmanaged'||this.saved[id]==='unmanaged'||this.state('text',`native_zone_${id}_config`)==='unmanaged'||(this.state('binary_sensor',`native_zone_${id}_owned`)==='off'&&!['clear',undefined,'unknown','unavailable'].includes(this.state('text',`native_zone_${id}_config`)));}
     nativeStatus(id){return this.state('sensor',`native_zone_${id}_status`);}
+    async adoptNative(id){
+        if(!this.native||this.saving||!this.saved[id]||this.saved[id]==='unmanaged')return;
+        if(this.dirty.size||this.pendingAreas.length||this.pendingClears.size){this.notice('Save or discard edits before adopting this geometry.','error');return;}
+        if(!this.overwriteNative.has(id)){this.notice(`Confirm writing sensor zone ${id} first.`,'error');return;}
+        const config=normalizeNativeZone(this.saved[id]);this.saving=true;this.render();
+        try{
+            await this._hass.callService('text','set_value',{entity_id:this.entity('text',`native_zone_${id}_config`),value:JSON.stringify({...config,overwrite:true})});
+            await this.waitUntil(()=>this.nativeStatus(id)==='ready'&&this.state('binary_sensor',`native_zone_${id}_owned`)==='on'&&this.same(this.saved[id],config),'Geometry takeover was not confirmed.',45000);
+            this.overwriteNative.delete(id);this.notice('Existing geometry adopted.','success');
+        }catch(error){this.notice(error.message,'error');}
+        finally{this.saving=false;this.render();}
+    }
     nativeEditable(id){return this.loaded.has(id)&&['ready','error'].includes(this.nativeStatus(id))&&!['unknown','unavailable',undefined].includes(this.state('text',`native_zone_${id}_config`));}
     hasNativeControls(){return Array.from({length:8},(_,i)=>this.state('text',`native_zone_${i+1}_config`)).some(value=>value!==undefined);}
     nativeTimeoutBusy(){for(let id=1;id<=8;id++)if(this.busy[this.entity('number',`zone_${id}_absence_timeout`)]||this.busy[this.entity('select',`zone_${id}_sensitivity`)])return true;return false;}
@@ -259,7 +271,7 @@ export class FP400ZoneCard extends (globalThis.HTMLElement ?? class {}) {
     }
     nativeSettingReady(id,key){
         const z=this.saved[id],value=this.state(key==='sensitivity'?'select':'number',`zone_${id}_${key}`);
-        return Boolean(this.native&&z&&z!=='unmanaged'&&!this.saving&&this.nativeEditable(id)&&this.nativeStatus(id)==='ready'&&value!==undefined&&value!==''&&(key==='sensitivity'?['low','medium','high'].includes(value):Number.isFinite(Number(value))));
+        return Boolean(this.native&&z&&z!=='unmanaged'&&!this.saving&&this.nativeEditable(id)&&this.nativeStatus(id)==='ready'&&this.state('binary_sensor',`native_zone_${id}_owned`)!=='off'&&value!==undefined&&value!==''&&(key==='sensitivity'?['low','medium','high'].includes(value):Number.isFinite(Number(value))));
     }
     switchZones(){
         if(this.saving||this.drag||this.dirty.size||this.pendingAreas.length||this.pendingClears.size||(this.native&&this.nativeTimeoutBusy())){this.notice('Save or discard your changes before switching zone types.','error');return;}
@@ -287,7 +299,7 @@ export class FP400ZoneCard extends (globalThis.HTMLElement ?? class {}) {
         const keys=[['sensor','targets_xy'],['sensor','tracking_status'],['sensor','tracking_last_update'],['text','remove_target'],['sensor','learning_result_time'],['button','spatial_learning'],['button','refresh_configuration']];
         for(const type of Object.keys(AREAS))keys.push(['sensor',`${type}_mask_hex`],['text',`${type}_mask_hex`],['text',`${type}_zone_add`],['text',`${type}_zone_remove`],['text',`${type}_clear`]);
         for(let i=1;i<=8;i++)keys.push(['text',`software_zone_${i}_config`],['binary_sensor',`software_zone_${i}_occupancy`],['binary_sensor',`software_zone_${i}_available`],['sensor',`software_zone_${i}_count`],['sensor',`software_zone_${i}_activity`]);
-        for(let i=1;i<=8;i++)keys.push(['text',`native_zone_${i}_config`],['sensor',`native_zone_${i}_status`],['sensor',`native_zone_${i}_error`],['binary_sensor',`native_zone_${i}_occupancy`],['sensor',`native_zone_${i}_count`],['number',`zone_${i}_absence_timeout`],['select',`zone_${i}_sensitivity`],['sensor',`native_zone_${i}_reporting`]);
+        for(let i=1;i<=8;i++)keys.push(['text',`native_zone_${i}_config`],['sensor',`native_zone_${i}_status`],['sensor',`native_zone_${i}_error`],['binary_sensor',`native_zone_${i}_occupancy`],['sensor',`native_zone_${i}_count`],['number',`zone_${i}_absence_timeout`],['select',`zone_${i}_sensitivity`],['sensor',`native_zone_${i}_reporting`],['sensor',`native_zone_${i}_source`],['binary_sensor',`native_zone_${i}_owned`]);
         for(const [,items] of SETTINGS)for(const [domain,key] of items)keys.push([domain,key]);
         keys.push(['sensor','learning_state'],['sensor','learning_result_code']);
         return keys.map(([domain,key])=>this.entity(domain,key));
@@ -325,14 +337,14 @@ export class FP400ZoneCard extends (globalThis.HTMLElement ?? class {}) {
                 try{data=JSON.parse(message.payload);}catch{return;}
                 if(!data||typeof data!=='object'||Array.isArray(data))return;
                 const keys=['targets_xy','tracking_targets','tracking_last_update','tracking_status',
-                    'interference_mask_hex','entry_exit_mask_hex','edge_mask_hex','learning_result_time','learning_state','learning_result_code',...Array.from({length:8},(_,i)=>`native_zone_${i+1}_reporting`)]
+                    'interference_mask_hex','entry_exit_mask_hex','edge_mask_hex','learning_result_time','learning_state','learning_result_code','native_catalogue_status','native_catalogue_error',...Array.from({length:8},(_,i)=>['reporting','source'].map(k=>`native_zone_${i+1}_${k}`)).flat()]
                     .filter(key=>Object.hasOwn(data,key));
                 if(!keys.length)return;
                 const next={...this.liveTracking};let editorChanged=false,positionsChanged=false;
                 for(const key of keys){
                     if(next[key]===data[key])continue;
                     next[key]=data[key];
-                    if(key.endsWith('_mask_hex')||key.startsWith('learning_')||key.startsWith('native_zone_'))editorChanged=true;
+                    if(key.endsWith('_mask_hex')||key.startsWith('learning_')||key.startsWith('native_'))editorChanged=true;
                     else positionsChanged=true;
                 }
                 if(!editorChanged&&!positionsChanged)return;
@@ -432,6 +444,7 @@ export class FP400ZoneCard extends (globalThis.HTMLElement ?? class {}) {
     notice(text,type=''){if(!this.mounted)return;const el=this.shadowRoot.querySelector('#message');el.textContent=text;el.className=`message ${type}`;}
     mark(id,z){if(!this.dirty.has(id))this.base[id]=clone(this.saved[id]);this.drafts[id]=z;if(this.same(z,this.saved[id])){this.dirty.delete(id);delete this.base[id];}else this.dirty.add(id);this.notice(this.dirty.size?`${this.dirty.size} zone${this.dirty.size===1?'':'s'} with unsaved changes.`:'All changes are saved.');}
     action(action,el){
+        if(action==='adopt-native'){void this.adoptNative(this.selected);return;}
         if(action==='zone-mode'){this.switchZones();return;}
         if(action==='settings'){this.panel=this.panel==='settings'?'zones':'settings';this.render();return;}
         if(action==='learn'){this.learn();return;}
@@ -745,9 +758,10 @@ export class FP400ZoneCard extends (globalThis.HTMLElement ?? class {}) {
         const reporting=this.trackingValue(`native_zone_${id}_reporting`),delivery=reporting==='polled'?'Presence is checked periodically.':reporting==='reported'?'Presence changes are reported by the sensor.':'';
         const timeoutField=`<label class="field">Empty delay · seconds<input data-setting="${timeoutId}" data-native-timeout="${id}" type="number" min="0" max="${timeout?.attributes?.max??300}" step="1" value="${ready?escapeHTML(timeout.state):''}" ${ready&&!this.busy[timeoutId]?'':'disabled'}/></label><p class="small-note">${ready?'Applies immediately to this sensor zone.':'Available after this zone is saved and the sensor is ready.'}</p>`;
         setHtml(el,`<h2 class="section-title">SENSOR ZONE ${id?`<span class="count-pill">${id}</span>`:''}</h2>`+
-            (z?`${unknown?'<p class="small-note">The sensor geometry for this slot is not confirmed. Paint a replacement only if you intend to write this slot.</p>':`${input('Name','name',z.name,'text','maxlength="32"')}${timeoutField}${sensitivityField}<p class="small-note">${delivery}</p><p class="small-note">${maskBits(z.mask_hex).size} cells · 0.5 m grid.</p>`}<div class="segmented"><button class="btn" data-action="native-paint" data-tool="add" ${off}>Paint</button><button class="btn" data-action="native-paint" data-tool="remove" ${unknown?'disabled':off}>Erase</button></div><button class="btn danger" data-action="delete" ${off}>Delete zone</button>`
+            (z?`${unknown?'<p class="small-note">The sensor geometry for this slot is not confirmed. Paint a replacement only if you intend to write this slot.</p>':`${input('Name','name',z.name,'text','maxlength="32"')}${timeoutField}${sensitivityField}<p class="small-note">${delivery} Geometry: ${escapeHTML(this.trackingValue(`native_zone_${id}_source`)??'acknowledged')}.</p><p class="small-note">${maskBits(z.mask_hex).size} cells · 0.5 m grid.</p>`}<div class="segmented"><button class="btn" data-action="native-paint" data-tool="add" ${off}>Paint</button><button class="btn" data-action="native-paint" data-tool="remove" ${unknown?'disabled':off}>Erase</button></div><button class="btn danger" data-action="delete" ${off}>Delete zone</button>`
             :`<p class="small-note">${id&&this.dirty.has(id)?'This zone will be removed when you save.':'Draw a sensor zone, or select one to paint or erase 0.5 m cells. Software zones stay separate.'}</p>`)+
             (overwrite?`<label class="small-note"><input type="checkbox" data-overwrite="${id}" ${this.overwriteNative.has(id)?'checked':''} ${this.saving?'disabled':''}/> I confirm writing or deleting sensor zone ${id}.</label>`:'')+
+            (overwrite&&z&&z!=='unmanaged'?`<button class="btn" data-action="adopt-native" ${this.saving?'disabled':''}>Use this existing geometry</button>`:'')+
             (this.nativeStatus(id)==='error'&&error?`<p class="message error">${escapeHTML(error)}</p>`:'')+this.areasSummary());
     }
     areasPanel(){
