@@ -4,11 +4,11 @@
 
 Runtime: Node 22.20.0; pinned root dependencies zigbee-herdsman 10.10.0, zigbee-herdsman-converters 26.115.1, playwright-core 1.49.0. The system Node 26.8.2 is outside herdsman's supported range; verification used Node 22.
 
-Integration runtime/test commit: d8bdbf5 (documentation, provenance and the isolated laboratory are added subsequently).
+Latest converter/unit-test commit: 5a087bd. The unchanged card/browser suite was tested at d8bdbf5. Subsequent documentation-only commits do not change those runtime files.
 
 | Check | Result | Scope |
 | --- | --- | --- |
-| Root unit suite | 166 passed, 0 failed | Converter, card logic, replay fixtures, concurrency, persistence and simulated devices |
+| Root unit suite | 167 passed, 0 failed | Converter, card logic, replay fixtures, concurrency, persistence and simulated devices |
 | Chromium browser suite | 166 passed, 0 failed | Full final suite; desktop/mobile, renamed settings, ordinary/admin users, MQTT reconnect/multiple cards, state ordering, native editor and import |
 | Ember laboratory | 18 passed, 0 failed | Published port's 16 tests plus converter boundary and exact size limit |
 | Ember strict type check | Passed | Patched full adapter against published package declarations; skipLibCheck |

@@ -12,7 +12,7 @@ All zone commands go to endpoint 1, cluster `0xFC0A`, manufacturer `0x115F`.
 | Update one zone | `0x06` | `0x07` |
 | Remove one zone | `0x08` | `0x09` |
 
-Append/Update carry a STRUCT with four typed members: zone ID (uint8), zone type (enum8, 0 for detection), a 40-byte OCTET_STR bitmap, and a boolean currently written as true (its physical meaning is not validated). The STRUCT parameter begins with its member count; there is no extra outer `0x4C` tag. A complete Append/Update ZCL frame is 55 bytes.
+Append/Update carry a STRUCT with four typed members: zone ID (uint8), zone type (enum8, 0 for detection), a 40-byte OCTET_STR bitmap, and a boolean whose physical meaning is not validated (new zones default to true; known values are preserved during takeover and later edits). The STRUCT parameter begins with its member count; there is no extra outer `0x4C` tag. A complete Append/Update ZCL frame is 55 bytes.
 
 The matching native response must contain `errorCode=0`. A generic Default Response SUCCESS is not the native command response. The converter uses herdsman's existing response matching and timeout, checks the returned error code, and confirms the endpoint map. A newly appended zone remains `pending` while the sensor initializes its endpoint. The existing 10-second poll completes it no earlier than 20 seconds after acknowledgement, restores any saved numeric timeout, reads it back, and only then publishes `ready`. This delay accommodates the delayed reset observed on firmware 20260724; there is no documented initialization-complete event. Existing-zone updates and removals do not need this creation delay.
 

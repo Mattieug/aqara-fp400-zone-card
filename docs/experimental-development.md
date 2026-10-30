@@ -22,7 +22,7 @@ Tracking renewal is acknowledged and renewed before the 120-second lease expires
 
 A complete catalogue read validates every typed record, mask and ID, and checks the endpoint map both before and after. A truncated reply or disagreement leaves the last geometry visible as cached and sets native_catalogue_status to uncertain. Source diagnostics distinguish observed, cached, acknowledged and unknown geometries.
 
-A zone created outside this converter is displayed without being adopted. Its geometry and scalar settings remain protected. Select the zone, confirm the takeover and choose “Use this existing geometry” before changing its settings. Reading a zone is not authorization to overwrite it.
+A zone created outside this converter is displayed without being adopted. Its geometry and scalar settings remain protected. Select the zone, confirm the takeover and choose “Use this existing geometry” before changing its settings. Reading a zone is not authorization to overwrite it. Takeover and later geometry edits preserve the observed opaque boolean in local metadata, without exposing an unverified enable/disable control.
 
 Recovery requires two identical complete catalogues at least 10 seconds apart, a completed scalar restoration and a locally confirmed zone that is absent in both the catalogue and endpoint map. Catalogue reads normally occur every 60 seconds. Only one missing zone is recreated per maintenance pass, followed by the existing endpoint-settling process. Pending/error operations, intentional deletions and existing zones are not automatically replaced. An unreadable catalogue, including a fragmentation failure, prevents recovery.
 
