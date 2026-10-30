@@ -782,7 +782,7 @@ export class FP400ZoneCard extends (globalThis.HTMLElement ?? class {}) {
     // Settings apply at once and count as done only when the sensor's reported state matches.
     async applySetting(input,descriptor){
         const id=input.dataset.setting;if(!id||this.busy[id])return;
-        const [domain,object]=id.split('.'),item=descriptor??SETTINGS.flatMap(([,items])=>items).find(([d,k])=>d===domain&&object===`${this.device}_${k}`);if(!item)return;
+        const [domain]=id.split('.'),item=descriptor??SETTINGS.flatMap(([,items])=>items).find(([d,k])=>d===domain&&this.entity(d,k)===id);if(!item)return;
         const nativeId=Number(input.dataset.nativeTimeout);if(nativeId&&(!this.nativeTimeoutReady(nativeId)||id!==this.entity('number',`zone_${nativeId}_absence_timeout`)))return;
         const [, ,label,extra]=item,a=this._hass.states[id]?.attributes??{},data={entity_id:id};let service,expected;
         try{
