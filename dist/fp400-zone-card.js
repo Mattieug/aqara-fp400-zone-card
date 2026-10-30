@@ -73,10 +73,9 @@ export function normalizeNativeZone(value){
     if(value==='unmanaged')return value;
     if(typeof value==='string')value=JSON.parse(value);
     if(!value||Array.isArray(value)||typeof value!=='object')throw new Error('Invalid native zone');
-    const z={name:value.name,mask_hex:value.mask_hex,absence_timeout:value.absence_timeout};
+    const z={name:value.name,mask_hex:value.mask_hex};
     if(typeof z.name!=='string'||!z.name.trim()||z.name.length>32)throw new Error('Give the zone a name (up to 32 characters).');
     if(typeof z.mask_hex!=='string'||!/^[0-9a-f]{80}$/i.test(z.mask_hex)||!/[1-9a-f]/i.test(z.mask_hex))throw new Error('Paint at least one 0.5 m cell for the native zone.');
-    if(!Number.isInteger(z.absence_timeout)||z.absence_timeout<0||z.absence_timeout>300)throw new Error('Empty delay must be 0–300 seconds.');
     z.mask_hex=z.mask_hex.toLowerCase();return z;
 }
 export function maskHex(bits){
@@ -237,8 +236,15 @@ export class FP400ZoneCard extends (globalThis.HTMLElement ?? class {}) {
     nativeOverwrite(id){return this.base[id]==='unmanaged'||this.saved[id]==='unmanaged'||this.state('text',`native_zone_${id}_config`)==='unmanaged';}
     nativeStatus(id){return this.state('sensor',`native_zone_${id}_status`);}
     nativeEditable(id){return this.loaded.has(id)&&['ready','error'].includes(this.nativeStatus(id))&&!['unknown','unavailable',undefined].includes(this.state('text',`native_zone_${id}_config`));}
+    hasNativeControls(){return Array.from({length:8},(_,i)=>this.state('text',`native_zone_${i+1}_config`)).some(value=>value!==undefined);}
+    nativeTimeoutBusy(){for(let id=1;id<=8;id++)if(this.busy[this.entity('number',`zone_${id}_absence_timeout`)])return true;return false;}
+    nativeTimeoutReady(id){
+        const z=this.saved[id],value=this.state('number',`zone_${id}_absence_timeout`);
+        return Boolean(this.native&&z&&z!=='unmanaged'&&!this.saving&&this.nativeEditable(id)&&this.nativeStatus(id)==='ready'&&value!==undefined&&value!==''&&Number.isFinite(Number(value)));
+    }
     switchZones(){
-        if(this.saving||this.drag||this.dirty.size||this.pendingAreas.length||this.pendingClears.size){this.notice('Save or discard your changes before switching zone types.','error');return;}
+        if(this.saving||this.drag||this.dirty.size||this.pendingAreas.length||this.pendingClears.size||(this.native&&this.nativeTimeoutBusy())){this.notice('Save or discard your changes before switching zone types.','error');return;}
+        if(!this.native&&!this.hasNativeControls()){this.notice('Enable native_zones in the FP400 device options in Zigbee2MQTT to use sensor zones.','error');return;}
         this.zoneMode=this.native?'software':'native';this.saved={};this.drafts={};this.base={};this.loaded.clear();this.overwriteNative.clear();
         this.selected=null;this.target=null;this.mode='select';this.firstFit=false;this.lastProblem=null;this.startedAt=null;this.watchedFor=null;
         this.sync();this.render();
@@ -261,7 +267,7 @@ export class FP400ZoneCard extends (globalThis.HTMLElement ?? class {}) {
         const keys=[['sensor','targets_xy'],['sensor','tracking_status'],['sensor','tracking_last_update'],['text','remove_target'],['sensor','learning_result_time'],['button','spatial_learning'],['button','refresh_configuration']];
         for(const type of Object.keys(AREAS))keys.push(['sensor',`${type}_mask_hex`],['text',`${type}_mask_hex`],['text',`${type}_zone_add`],['text',`${type}_zone_remove`],['text',`${type}_clear`]);
         for(let i=1;i<=8;i++)keys.push(['text',`software_zone_${i}_config`],['binary_sensor',`software_zone_${i}_occupancy`],['binary_sensor',`software_zone_${i}_available`],['sensor',`software_zone_${i}_count`],['sensor',`software_zone_${i}_activity`]);
-        for(let i=1;i<=8;i++)keys.push(['text',`native_zone_${i}_config`],['sensor',`native_zone_${i}_status`],['sensor',`native_zone_${i}_error`],['binary_sensor',`native_zone_${i}_occupancy`],['sensor',`native_zone_${i}_count`]);
+        for(let i=1;i<=8;i++)keys.push(['text',`native_zone_${i}_config`],['sensor',`native_zone_${i}_status`],['sensor',`native_zone_${i}_error`],['binary_sensor',`native_zone_${i}_occupancy`],['sensor',`native_zone_${i}_count`],['number',`zone_${i}_absence_timeout`]);
         for(const [,items] of SETTINGS)for(const [domain,key] of items)keys.push([domain,key]);
         return keys.map(([domain,key])=>this.entity(domain,key));
     }
@@ -283,7 +289,7 @@ export class FP400ZoneCard extends (globalThis.HTMLElement ?? class {}) {
         this.mounted=true;this.svg=this.shadowRoot.querySelector('svg');
         this.shadowRoot.addEventListener('click',e=>{const b=e.target.closest('[data-action]');if(b&&!b.disabled)this.action(b.dataset.action,b);const row=e.target.closest('[data-zone]');if(row&&!this.saving){this.selected=Number(row.dataset.zone);this.target=null;this.mode='select';this.render();}});
         this.shadowRoot.querySelector('#snap').addEventListener('change',e=>{this.snap=Number(e.target.value);});
-        this.shadowRoot.querySelector('#inspector').addEventListener('change',e=>{if(e.target.dataset.overwrite){const id=Number(e.target.dataset.overwrite);e.target.checked?this.overwriteNative.add(id):this.overwriteNative.delete(id);this.renderButtons();}else this.editField(e);});
+        this.shadowRoot.querySelector('#inspector').addEventListener('change',e=>{if(e.target.dataset.overwrite){const id=Number(e.target.dataset.overwrite);e.target.checked?this.overwriteNative.add(id):this.overwriteNative.delete(id);this.renderButtons();}else if(e.target.dataset.nativeTimeout){const id=Number(e.target.dataset.nativeTimeout);this.applySetting(e.target,['number',`zone_${id}_absence_timeout`,`Zone ${id} empty delay`,{unit:'s',min:0}]);}else this.editField(e);});
         this.shadowRoot.querySelector('#settings').addEventListener('change',e=>this.applySetting(e.target));
         this.svg.addEventListener('pointerdown',e=>this.pointerDown(e));this.svg.addEventListener('pointermove',e=>this.pointerMove(e));this.svg.addEventListener('pointerup',e=>this.pointerEnd(e));this.svg.addEventListener('pointercancel',e=>this.pointerEnd(e,true));this.svg.addEventListener('lostpointercapture',e=>this.pointerEnd(e,true));
         this.svg.addEventListener('wheel',e=>this.wheel(e),{passive:false});
@@ -324,7 +330,8 @@ export class FP400ZoneCard extends (globalThis.HTMLElement ?? class {}) {
         if(areas!==this.lastAreas){this.lastAreas=areas;changed=true;}
         // The result time comes from the server's clock, so watch for it to change rather than comparing clocks.
         if(this.learnBefore!==undefined&&this.state('sensor','learning_result_time')!==this.learnBefore){this.learnBefore=undefined;this.notice('Room learning finished.','success');}
-        if(changed&&!this.drag){this.renderList();if(!this.inside('#inspector'))this.renderInspector();}
+        if(!this.drag){if(changed)this.renderList();if((changed||this.native)&&!this.inside('#inspector'))this.renderInspector();}
+        if(this.native&&!this.hasNativeControls())this.notice('Native zone controls are unavailable. Enable native_zones in Zigbee2MQTT, or discard edits to return to software zones.','error');
         if(this.panel==='settings'&&!this.inside('#settings'))this.renderSettings();
         this.renderMap();this.renderLive();this.renderButtons();
     }
@@ -430,7 +437,7 @@ export class FP400ZoneCard extends (globalThis.HTMLElement ?? class {}) {
             const original=d.original&&d.original!=='unmanaged'?d.original:null;
             const bits=new Set(original?maskBits(original.mask_hex):[]);
             if(rect)for(const bit of opBits({rect,rotation:this.rotation}))d.tool==='remove'?bits.delete(bit):bits.add(bit);
-            if(bits.size)this.mark(d.id,{name:original?.name??`Zone ${d.id}`,mask_hex:maskHex(bits),absence_timeout:original?.absence_timeout??3});
+            if(bits.size)this.mark(d.id,{name:original?.name??`Zone ${d.id}`,mask_hex:maskHex(bits)});
             else this.mark(d.id,d.original);
             d.empty=Boolean(original)&&!bits.size;
             this.renderMap();this.renderButtons();return;
@@ -513,7 +520,6 @@ export class FP400ZoneCard extends (globalThis.HTMLElement ?? class {}) {
             if(this.native){
                 if(z==='unmanaged'||!this.nativeEditable(id))return;
                 if(field==='name')z.name=event.target.value;
-                else if(field==='absence_timeout'){if(!event.target.value.trim())throw new Error('Enter a valid number.');z.absence_timeout=Number(event.target.value);}
                 normalizeNativeZone(z);this.mark(id,z);this.render();return;
             }
             if(field==='name')z.name=event.target.value;
@@ -604,6 +610,7 @@ export class FP400ZoneCard extends (globalThis.HTMLElement ?? class {}) {
     }
     loadingProblem(){
         const zones=[1,2,3,4,5,6,7,8].map(id=>this.state('text',this.zoneKey(id,'config')));
+        if(this.native&&zones.every(z=>z===undefined))return 'Enable native_zones in the FP400 device options in Zigbee2MQTT to use sensor zones.';
         if(zones.every(z=>z===undefined))return `Home Assistant has no zone controls for the FP400 "${this.device}". Check that the converter is installed and that Zigbee2MQTT has restarted (see the README).`;
         if(zones.some(z=>z==='unavailable'))return 'Zigbee2MQTT or the FP400 is offline right now. Your zones are kept in Zigbee2MQTT and come back when it reconnects.';
         return 'Zigbee2MQTT has not sent your saved zones yet. After a restart this can take a minute.';
@@ -641,8 +648,10 @@ export class FP400ZoneCard extends (globalThis.HTMLElement ?? class {}) {
         const disabled=this.saving||!this.nativeEditable(id),off=disabled?'disabled':'',unknown=z==='unmanaged';
         const input=(label,key,value,type='number',extra='')=>`<label class="field">${label}<input data-field="${key}" data-for="${id}" type="${type}" value="${escapeHTML(value)}" ${extra} ${off}/></label>`;
         const error=this.state('sensor',`native_zone_${id}_error`);
+        const timeoutId=this.entity('number',`zone_${id}_absence_timeout`),timeout=this._hass?.states?.[timeoutId],ready=this.nativeTimeoutReady(id);
+        const timeoutField=`<label class="field">Empty delay · seconds<input data-setting="${timeoutId}" data-native-timeout="${id}" type="number" min="0" max="${timeout?.attributes?.max??300}" step="1" value="${ready?escapeHTML(timeout.state):''}" ${ready&&!this.busy[timeoutId]?'':'disabled'}/></label><p class="small-note">${ready?'Applies immediately to this sensor zone.':'Available after this zone is saved and the sensor is ready.'}</p>`;
         setHtml(el,`<h2 class="section-title">SENSOR ZONE ${id?`<span class="count-pill">${id}</span>`:''}</h2>`+
-            (z?`${unknown?'<p class="small-note">The sensor geometry for this slot is not confirmed. Paint a replacement only if you intend to write this slot.</p>':`${input('Name','name',z.name,'text','maxlength="32"')}${input('Empty delay · seconds','absence_timeout',z.absence_timeout,'number','min="0" max="300" step="1"')}<p class="small-note">${maskBits(z.mask_hex).size} cells · 0.5 m grid.</p>`}<div class="segmented"><button class="btn" data-action="native-paint" data-tool="add" ${off}>Paint</button><button class="btn" data-action="native-paint" data-tool="remove" ${unknown?'disabled':off}>Erase</button></div><button class="btn danger" data-action="delete" ${off}>Delete zone</button>`
+            (z?`${unknown?'<p class="small-note">The sensor geometry for this slot is not confirmed. Paint a replacement only if you intend to write this slot.</p>':`${input('Name','name',z.name,'text','maxlength="32"')}${timeoutField}<p class="small-note">${maskBits(z.mask_hex).size} cells · 0.5 m grid.</p>`}<div class="segmented"><button class="btn" data-action="native-paint" data-tool="add" ${off}>Paint</button><button class="btn" data-action="native-paint" data-tool="remove" ${unknown?'disabled':off}>Erase</button></div><button class="btn danger" data-action="delete" ${off}>Delete zone</button>`
             :`<p class="small-note">${id&&this.dirty.has(id)?'This zone will be removed when you save.':'Draw a sensor zone, or select one to paint or erase 0.5 m cells. Software zones stay separate.'}</p>`)+
             (overwrite?`<label class="small-note"><input type="checkbox" data-overwrite="${id}" ${this.overwriteNative.has(id)?'checked':''} ${this.saving?'disabled':''}/> I confirm writing or deleting sensor zone ${id}.</label>`:'')+
             (this.nativeStatus(id)==='error'&&error?`<p class="message error">${escapeHTML(error)}</p>`:'')+this.areasSummary());
@@ -687,9 +696,10 @@ export class FP400ZoneCard extends (globalThis.HTMLElement ?? class {}) {
         return `<label class="setting"${hint?` title="${escapeHTML(hint)}"`:''}><span>${label} · ${unit}</span><input type="number" ${attrs} min="${min/scale}" max="${(a.max??65535)/scale}" step="1" value="${s.state!==''&&Number.isFinite(value)?value/scale:''}"></label>`;
     }
     // Settings apply at once and count as done only when the sensor's reported state matches.
-    async applySetting(input){
+    async applySetting(input,descriptor){
         const id=input.dataset.setting;if(!id||this.busy[id])return;
-        const [domain,object]=id.split('.'),item=SETTINGS.flatMap(([,items])=>items).find(([d,k])=>d===domain&&object===`${this.device}_${k}`);if(!item)return;
+        const [domain,object]=id.split('.'),item=descriptor??SETTINGS.flatMap(([,items])=>items).find(([d,k])=>d===domain&&object===`${this.device}_${k}`);if(!item)return;
+        const nativeId=Number(input.dataset.nativeTimeout);if(nativeId&&(!this.nativeTimeoutReady(nativeId)||id!==this.entity('number',`zone_${nativeId}_absence_timeout`)))return;
         const [, ,label,extra]=item,a=this._hass.states[id]?.attributes??{},data={entity_id:id};let service,expected;
         try{
             if(domain==='switch'){service=input.checked?'turn_on':'turn_off';expected=input.checked?'on':'off';}
@@ -699,12 +709,12 @@ export class FP400ZoneCard extends (globalThis.HTMLElement ?? class {}) {
                 if(!input.value.trim()||!Number.isFinite(value)||value<min||value>max)throw new Error(`${label}: enter a number from ${min/scale} to ${max/scale}.`);
                 service='set_value';data.value=expected=value;
             }
-            this.busy[id]=true;this.renderSettings();this.notice(`Saving ${label}…`);
+            this.busy[id]=true;this.renderSettings();if(nativeId){this.renderInspector();this.renderButtons();}this.notice(`Saving ${label}…`);
             await this._hass.callService(domain,service,data);
             await this.waitUntil(()=>{const now=this._hass.states[id]?.state;return domain==='number'?Number(now)===expected:now===expected;},`The sensor did not confirm ${label}. Check it again in a moment.`);
             this.notice(`Saved: ${label}.`,'success');
         }catch(error){this.notice(error?.message??String(error),'error');}
-        finally{delete this.busy[id];this.shadowRoot.querySelector('#settings')._html=null;this.renderSettings();}
+        finally{delete this.busy[id];this.shadowRoot.querySelector('#settings')._html=null;this.renderSettings();if(nativeId){this.shadowRoot.querySelector('#inspector')._html=null;this.renderInspector();this.renderButtons();}}
     }
     async press(key,message){
         try{await this._hass.callService('button','press',{entity_id:this.entity('button',key)});this.notice(message,'success');return true;}
@@ -744,12 +754,14 @@ export class FP400ZoneCard extends (globalThis.HTMLElement ?? class {}) {
         const hasChanges=this.dirty.size>0||areaChanges;
         const missing=[...this.dirty].some(id=>['unknown','unavailable',undefined].includes(this.state('text',this.zoneKey(id,'config')))||(this.native&&!this.nativeEditable(id)))||[...this.pendingClears,...this.pendingAreas.map(o=>o.type)].some(t=>!this.areaReady(t));
         const save=this.shadowRoot.querySelector('[data-action="save"]');
-        save.disabled=this.saving||!hasChanges||missing;
+        const nativeBusy=this.native&&this.nativeTimeoutBusy();
+        save.disabled=this.saving||nativeBusy||!hasChanges||missing;
         save.textContent=this.saving?'Saving…':this.dirty.size&&areaChanges?'Save all':areaChanges?'Save areas':'Save zones';
         this.shadowRoot.querySelector('[data-action="discard"]').disabled=this.saving||!hasChanges;
         const switcher=this.shadowRoot.querySelector('[data-action="zone-mode"]');
         switcher.textContent=this.native?'Native zones':'Software zones';switcher.classList.toggle('active',this.native);
-        switcher.disabled=this.saving||Boolean(this.drag)||this.dirty.size>0||areaChanges;
+        switcher.disabled=this.saving||nativeBusy||Boolean(this.drag)||this.dirty.size>0||areaChanges;
+        switcher.title=this.native?'Switch to software zones':this.hasNativeControls()?'Switch to native sensor zones':'Enable native_zones in Zigbee2MQTT to use sensor zones';
         this.shadowRoot.querySelector('#snap').disabled=this.native;
         this.shadowRoot.querySelector('#snap').value=String(this.native?50:this.snap);
         const drawBtn=this.shadowRoot.querySelector('[data-action="draw"]');
@@ -793,6 +805,7 @@ export class FP400ZoneCard extends (globalThis.HTMLElement ?? class {}) {
         }
     }
     async save(){
+        if(this.native&&this.nativeTimeoutBusy()){this.notice('Wait for the sensor to confirm the zone empty delay.','error');return;}
         if(this.saving||(!this.dirty.size&&!this.pendingAreas.length&&!this.pendingClears.size))return;
         const ids=[...this.dirty].sort(),completed=[];let areasDone=0;
         try{
@@ -817,7 +830,7 @@ export class FP400ZoneCard extends (globalThis.HTMLElement ?? class {}) {
                     const status=this._hass.states?.[this.entity('sensor',`native_zone_${id}_status`)];
                     if(status?.state==='error'&&status!==before)throw new Error(this.state('sensor',`native_zone_${id}_error`)||`Native zone ${id} failed.`);
                     return status?.state==='ready'&&this.loaded.has(id)&&this.same(this.saved[id],z);
-                },`Native zone ${id} was not confirmed. Its unsaved edit is kept; check the connection and retry.`);
+                },`Native zone ${id} was not confirmed. Its unsaved edit is kept; check the connection and retry.`,45000);
                 else await this.confirm(id,z);
                 this.dirty.delete(id);delete this.base[id];this.overwriteNative.delete(id);completed.push(id);
                 await this.nameEntities(id,z,old);

@@ -105,8 +105,9 @@ test('a native zone timeout can be 0 although the sensor reports 10 s as its min
     const control = definition.toZigbee.find(c => c.key.includes('zone_1_absence_timeout'));
     const written = [];
     const endpoint = {
+        ID: 3,
         read: async (cluster, [id]) => {
-            if (cluster === 'aqaraFp400Radar') return {1: 1};
+            if (cluster === 'aqaraFp400Radar') return id === 0 ? {0: [3]} : {1: 1};
             if (id === 4) return {4: [{elmVal: 10}, {elmVal: 300}]};
             return {3: written.at(-1)};
         },

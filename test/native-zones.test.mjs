@@ -2,12 +2,12 @@ import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {Zcl} from 'zigbee-herdsman';
 import {prepareDefinition} from 'zigbee-herdsman-converters';
-import definition, {readNativeZoneMap, nativeZoneState, fp400UnreportedPoll, fp400ReportingSlots, parseNativeZone} from '../z2m/aqara-fp400.mjs';
+import definition, {readNativeZoneMap, nativeZoneState, fp400UnreportedPoll, fp400ReportingSlots, fp400Poll, parseNativeZone} from '../z2m/aqara-fp400.mjs';
 
 const model = prepareDefinition({...definition});
 const control = model.toZigbee.find(c => c.key.includes('native_zone_1_config'));
 const mask = '00000000000001000100010000000000000000000000000000000000000000000000000000000000';
-const config = {name: 'Desk', mask_hex: mask, absence_timeout: 0};
+const config = {name: 'Desk', mask_hex: mask};
 let sequence = 0;
 function sensor(entries = []) {
     const zones = new Map(entries), endpoints = new Map(), published = [], commands = [], writes = [], reads = [];
@@ -22,10 +22,13 @@ function sensor(entries = []) {
                 bind: async () => {}, configureReporting: async () => {},
                 read: async (cluster, [attr]) => {
                     reads.push([ID, cluster, attr]);
+                    if (device.requireRegistration && typeof cluster === 'string' && cluster.startsWith('aqara') && !device.customClusters[cluster]) throw new Error('custom cluster not registered');
                     if (device.failRead?.(ID, cluster, attr)) throw new Error('read failed');
                     if (cluster === 'aqaraFp400Radar' && attr === 0) return {0: [...zones.values()]};
                     if (cluster === 'aqaraFp400Radar' && attr === 1) return {1: [...zones].find(([, ep]) => ep === ID)?.[0]};
                     if (cluster === 'aqaraFp400Config' && attr === 17) return {17: device.capacity};
+                    if (cluster === 'msOccupancySensing' && attr === 4) return {4: [{elmVal: 10}, {elmVal: 300}]};
+                    if (cluster === 'aqaraFp400Config' && [18, 19, 20].includes(attr)) return {[attr]: Buffer.alloc(40)};
                     if (cluster === 'msOccupancySensing' && attr === 3) return {3: endpoints.get(ID).timeout};
                     return {[attr]: 0};
                 },
@@ -50,19 +53,23 @@ function sensor(entries = []) {
     };
     return device;
 }
-const meta = device => ({device, publish: state => device.published.push(state)});
+const meta = device => ({device, options: {native_zones: true}, publish: state => device.published.push(state)});
 const set = (device, value, id = 1) => control.convertSet(null, `native_zone_${id}_config`, value, meta(device));
-const start = device => model.onEvent({type: 'start', data: {device, options: {disabled: true}}});
+const start = device => model.onEvent({type: 'start', data: {device, options: {disabled: true, native_zones: true}}});
 const stop = device => model.onEvent({type: 'stop', data: {ieeeAddr: device.ieeeAddr}});
 
-test('native append/update/remove encode captured M3 commands, keep holes, and persist pending before I/O', async () => {
+test('native append/update/remove encode captured M3 commands, keep holes, and persist pending before I/O', async t => {
+    let now = 1e12; t.mock.method(Date, 'now', () => now);
     const device = sensor([[99, 4]]);
-    device.meta.fp400Saved = {old: {name: 'zone_1_absence_timeout'}, keep: {name: 'installation_height'}};
+    device.meta.fp400Saved = {old: {name: 'zone_1_absence_timeout', endpoint: 3, cluster: 'msOccupancySensing', attribute: 3, type: 0x21, value: 0}};
     await start(device);
     const first = await set(device, config);
-    assert.deepEqual(JSON.parse(first.state.native_zone_1_config), config);
+    assert.equal(first.state.native_zone_1_status, 'pending');
+    assert.equal(first.state.native_zone_1_config, 'unmanaged');
+    now += 20000; await fp400Poll(device);
+    assert.deepEqual(JSON.parse(nativeZoneState(device).native_zone_1_config), config);
     assert.equal(device.commands[0].persisted.fp400NativeZones[1].status, 'pending');
-    assert.deepEqual(device.meta.fp400Saved, {keep: {name: 'installation_height'}});
+    assert.equal(device.meta.fp400Saved['7/msOccupancySensing/3'].value, 0);
     assert.equal(device.published[0].native_zone_1_config, 'unmanaged');
     assert.equal(device.published[0].native_zone_1_status, 'pending');
     assert.equal(device.writes[0][0], 7, 'uses assigned endpoint, not id+2');
@@ -102,7 +109,8 @@ test('foreign IDs, including an ID reused after clear, require explicit overwrit
     await stop(device);
 });
 
-test('missing native ACK, rejection, and a failed timeout write leave uncertain geometry after restart', async () => {
+test('missing native ACK, rejection, and a failed timeout restore leave uncertain geometry after restart', async t => {
+    let now = 1e12; t.mock.method(Date, 'now', () => now);
     for (const response of [{cmdId: 4, statusCode: 0}, {errorCode: 1}, new Error('Timeout')]) {
         const device = sensor(); device.response = response;
         await assert.rejects(set(device, config));
@@ -112,29 +120,33 @@ test('missing native ACK, rejection, and a failed timeout write leave uncertain 
         await readNativeZoneMap(device);
         assert.equal(nativeZoneState(device).native_zone_1_config, 'unmanaged');
         device.response = {errorCode: 0};
-        assert.equal((await set(device, config)).state.native_zone_1_status, 'ready');
+        assert.equal((await set(device, config)).state.native_zone_1_status, 'pending');
+        now += 20000; await fp400Poll(device);
+        assert.equal(nativeZoneState(device).native_zone_1_status, 'ready');
         await stop(device);
     }
     const device = sensor(); device.failWrite = true;
-    await assert.rejects(set(device, config), /write failed/);
+    device.meta.fp400Saved = {old: {name: 'zone_1_absence_timeout', endpoint: 3, cluster: 'msOccupancySensing', attribute: 3, type: 0x21, value: 42}};
+    await set(device, config); now += 20000; await fp400Poll(device);
     assert.equal(nativeZoneState(device).native_zone_1_config, 'unmanaged');
     assert.equal(device.persisted.fp400NativeZones[1].status, 'error');
     await stop(device);
 });
 
-test('failed metadata save prevents sending, and failed final save never publishes confirmed geometry', async () => {
+test('failed metadata save prevents sending, and failed final save never publishes confirmed geometry', async t => {
+    let now = 1e12; t.mock.method(Date, 'now', () => now);
     const device = sensor(); device.failSave = n => n === 1;
     await assert.rejects(set(device, config), /disk failed/);
     assert.equal(device.commands.length, 0);
-    const second = sensor(); second.failSave = n => n === 3; // pending, reporting allocation, final confirmation
-    await assert.rejects(set(second, config), /disk failed/);
+    const second = sensor(); second.failSave = () => second.meta.fp400NativeZones?.[1]?.status === 'ready';
+    await set(second, config); now += 20000; await fp400Poll(second);
     assert.equal(nativeZoneState(second).native_zone_1_config, 'unmanaged');
     assert.equal(second.persisted.fp400NativeZones[1].status, 'error');
     assert.ok(second.published.every(s => s.native_zone_1_config === 'unmanaged'));
     await stop(device); await stop(second);
 });
 
-test('an interrupted save becomes retryable error at start; normal start and announce never write A0', async () => {
+test('an interrupted save becomes retryable error at start; start, announce and successful interview never write A0', async () => {
     const device = sensor([[1, 7]]);
     device.meta.fp400NativeZones = {1: {config, status: 'pending', error: ''}};
     await start(device);
@@ -145,7 +157,7 @@ test('an interrupted save becomes retryable error at start; normal start and ann
     await definition.onEvent({type: 'deviceInterview', data: {device, status: 'started'}});
     assert.equal(device.writes.length, 0);
     await definition.onEvent({type: 'deviceInterview', data: {device, status: 'successful'}});
-    assert.deepEqual(device.writes, [[1, 0xfcc0, {160: {value: 1, type: 0x20}}, {manufacturerCode: 0x115f, disableDefaultResponse: false}]]);
+    assert.deepEqual(device.writes, []);
     await stop(device);
 });
 
@@ -166,7 +178,7 @@ test('reports follow actual ZoneID after endpoint reorder and zone count cannot 
     const report = async (cluster, ep, data) => {
         const result = {};
         for (const converter of model.fromZigbee.filter(c => c.cluster === cluster && c.type.includes('attributeReport'))) {
-            Object.assign(result, await converter.convert(model, {cluster, type: 'attributeReport', endpoint: device.getEndpoint(ep), device, data}, meta(device).publish, {}, meta(device)));
+            Object.assign(result, await converter.convert(model, {cluster, type: 'attributeReport', endpoint: device.getEndpoint(ep), device, data}, meta(device).publish, {native_zones: true}, meta(device)));
         }
         return result;
     };
@@ -203,5 +215,124 @@ test('capacity and Home Assistant text length are enforced before sending geomet
     assert.throws(() => parseNativeZone({...config, name: '\\'.repeat(32), overwrite: true, mask_hex: '0'.repeat(80)}), /mask/);
     assert.throws(() => parseNativeZone({...config, name: '\u0001'.repeat(32), overwrite: true}), /255/);
     assert.throws(() => parseNativeZone({clear: true, mask_hex: mask}), /Clear/);
+    await stop(device);
+});
+
+
+test('append survives the delayed 10 s timeout reset and confirms only after 20 s', async t => {
+    let now = 1e12; t.mock.method(Date, 'now', () => now);
+    const device = sensor();
+    device.meta.fp400Saved = {old: {name: 'zone_1_absence_timeout', endpoint: 3, cluster: 'msOccupancySensing', attribute: 3, type: 0x21, value: 42}};
+    device.getEndpoint(7).timeout = 0;
+    await set(device, config);
+    const number = model.toZigbee.find(c => c.key.includes('zone_1_absence_timeout'));
+    await assert.rejects(number.convertSet(null, 'zone_1_absence_timeout', 25, meta(device)), /wait until ready/);
+    now += 10000; device.getEndpoint(7).timeout = 10; await fp400Poll(device);
+    assert.equal(device.getEndpoint(7).timeout, 10);
+    assert.equal(device.writes.length, 0, 'legacy restore must also wait');
+    assert.equal(nativeZoneState(device).native_zone_1_status, 'pending');
+    now += 9999; await fp400Poll(device);
+    assert.equal(nativeZoneState(device).native_zone_1_status, 'pending');
+    now++; await fp400Poll(device);
+    assert.equal(nativeZoneState(device).native_zone_1_status, 'ready');
+    assert.equal(device.getEndpoint(7).timeout, 42);
+    assert.equal(device.published.at(-1).zone_1_absence_timeout, 42);
+    assert.deepEqual(JSON.parse(device.published.at(-1).native_zone_1_config), config);
+    await number.convertSet(null, 'zone_1_absence_timeout', 25, meta(device));
+    assert.equal(device.writes.at(-1)[0], 7);
+    assert.equal(device.getEndpoint(7).timeout, 25);
+    assert.equal(device.meta.fp400Saved['7/msOccupancySensing/3'].value, 25);
+    await stop(device);
+});
+
+test('retrying an uncertain append before initialization ends cannot confirm early', async t => {
+    let now = 1e12; t.mock.method(Date, 'now', () => now);
+    const device = sensor(); device.response = {statusCode: 0};
+    await assert.rejects(set(device, config), /not acknowledged/);
+    const deadline = device.persisted.fp400NativeZones[1].settleUntil;
+    now += 10000; device.response = {errorCode: 0};
+    assert.equal((await set(device, {...config, name: 'Retry'})).state.native_zone_1_status, 'pending');
+    assert.equal(device.commands.at(-1).name, 'updateZone');
+    assert.equal(device.meta.fp400NativeZones[1].settleUntil, deadline);
+    now = deadline; await fp400Poll(device);
+    assert.equal(nativeZoneState(device).native_zone_1_status, 'ready');
+    assert.equal(device.published.at(-1).zone_1_absence_timeout, 10, 'read default when no numeric preference was saved');
+    await stop(device);
+});
+
+test('startup registers clusters before refreshing, and map cache survives errors without minute reads', async () => {
+    const device = sensor([[1, 7]]); device.requireRegistration = true;
+    device.meta.fp400NativeZones = {1: {config: {...config, absence_timeout: 55}, status: 'ready', error: ''}};
+    await start(device);
+    assert.deepEqual(JSON.parse(nativeZoneState(device).native_zone_1_config), config, 'old JSON loses its duplicated timeout field');
+    device.failRead = (id, cluster, attr) => cluster === 'aqaraFp400Radar' && attr === 0;
+    await assert.rejects(control.convertGet(null, 'native_zone_1_config', meta(device)), /read failed/);
+    assert.equal(nativeZoneState(device).native_zone_1_status, 'ready');
+    assert.equal(nativeZoneState(device).native_zone_1_count, 0);
+    assert.deepEqual(JSON.parse(nativeZoneState(device).native_zone_1_config), config);
+    device.reads.length = 0; await fp400UnreportedPoll(device);
+    assert.ok(!device.reads.some(([, cluster, attr]) => cluster === 'aqaraFp400Radar' && attr === 0));
+    device.failRead = undefined; device.zones.set(1, 3);
+    await fp400Poll(device);
+    assert.ok(device.reads.some(([, cluster, attr]) => cluster === 'aqaraFp400Radar' && attr === 0), '10 s poll retries dirty map');
+    device.reads.length = 0; await fp400Poll(device);
+    assert.ok(!device.reads.some(([, cluster, attr]) => cluster === 'aqaraFp400Radar' && attr === 0), 'successful maps are not periodically reread');
+    device.zones.delete(1);
+    await model.onEvent({type: 'deviceAnnounce', data: {device, options: {native_zones: true}}});
+    assert.equal(nativeZoneState(device).native_zone_1_config, 'unmanaged', 'announce refresh detects the lost zone');
+    await stop(device);
+});
+
+test('native option controls exactly 40 exposes, discovery and output, while all other entities remain', async () => {
+    const device = sensor([[1, 7]]), normal = model.exposes(device, {}), enabled = model.exposes(device, {native_zones: true});
+    assert.equal(enabled.length - normal.length, 40);
+    assert.deepEqual(enabled.filter(e => !e.property?.startsWith('native_zone_')), normal);
+    assert.ok(!normal.some(e => e.property?.startsWith('native_zone_')));
+    for (const method of ['convertGet', 'convertSet']) {
+        const args = method === 'convertSet' ? [null, 'native_zone_1_config', config, {...meta(device), options: {}}] : [null, 'native_zone_1_config', {...meta(device), options: {}}];
+        await assert.rejects(control[method](...args), /Enable the native_zones/);
+    }
+    let discovery = 0;
+    await model.onEvent({type: 'deviceOptionsChanged', data: {device, from: {}, to: {native_zones: true}, options: {native_zones: true}, deviceExposesChanged: () => discovery++}});
+    assert.equal(discovery, 1); assert.equal(nativeZoneState(device).native_zone_1_config, 'unmanaged');
+    const heartbeat = model.fromZigbee.find(c => c.cluster === 'aqaraFp400Radar' && c.type.includes('attributeReport'));
+    const state = heartbeat.convert(model, {device, endpoint: device.getEndpoint(1), data: {humanCount: 1}}, meta(device).publish, {});
+    assert.ok(!Object.keys(state).some(key => key.startsWith('native_zone_')));
+    assert.deepEqual(nativeZoneState(device), {});
+    await stop(device);
+});
+
+test('timeout in native JSON is rejected with the existing number setting as replacement', async () => {
+    assert.throws(() => parseNativeZone({...config, absence_timeout: 42}), /zone_N_absence_timeout/);
+});
+
+
+test('inactive slot reads cannot replace settings of a zone mapped to another endpoint', async () => {
+    const device = sensor([[1, 7]]);
+    await readNativeZoneMap(device);
+    const report = async (endpoint, value) => {
+        const state = {}, msg = {cluster: 'msOccupancySensing', type: 'readResponse', endpoint: device.getEndpoint(endpoint), device, data: {3: value}};
+        for (const converter of model.fromZigbee.filter(c => c.cluster === msg.cluster && c.type.includes(msg.type))) {
+            Object.assign(state, await converter.convert(model, msg, meta(device).publish, {native_zones: true}, meta(device)));
+        }
+        return state;
+    };
+    assert.equal((await report(7, 42)).zone_1_absence_timeout, 42);
+    assert.equal((await report(3, 10)).zone_1_absence_timeout, undefined);
+    await stop(device);
+});
+
+test('confirmed removal does not restore its old timeout into a foreign zone reusing the ID', async () => {
+    const device = sensor([[1, 7]]);
+    await set(device, {...config, overwrite: true});
+    const number = model.toZigbee.find(c => c.key.includes('zone_1_absence_timeout'));
+    await number.convertSet(null, 'zone_1_absence_timeout', 3, meta(device));
+    await set(device, 'clear');
+    device.zones.set(1, 7); device.getEndpoint(7).timeout = 10;
+    await model.onEvent({type: 'deviceAnnounce', data: {device, options: {native_zones: true}}});
+    await fp400Poll(device);
+    assert.equal(device.getEndpoint(7).timeout, 10);
+    assert.ok(!Object.values(device.meta.fp400Saved).some(setting => setting.name === 'zone_1_absence_timeout'));
+    assert.equal(nativeZoneState(device).native_zone_1_config, 'unmanaged');
     await stop(device);
 });

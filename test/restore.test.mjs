@@ -22,8 +22,10 @@ function fakeSensor(ieeeAddr) {
         attr: (endpoint, cluster, id) => attributes.get(`${endpoint}/${cluster}/${id}`),
         setAttr: (endpoint, cluster, id, value) => attributes.set(`${endpoint}/${cluster}/${id}`, value),
         getEndpoint: endpoint => ({
+            ID: endpoint,
             read: async (cluster, ids) => {
                 if (device.offline) throw new Error('Timeout');
+                if (cluster === 'aqaraFp400Radar' && ids[0] === 0) return {0: [...attributes.keys()].filter(key => key.endsWith('/aqaraFp400Radar/1')).map(key => Number(key.split('/')[0]))};
                 const data = {};
                 for (const id of ids) {
                     const value = attributes.get(`${endpoint}/${cluster}/${id}`);

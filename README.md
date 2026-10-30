@@ -10,7 +10,7 @@ Draw presence zones, doorways and "ghost" spots for the **Aqara FP400** spatial 
 ![The card: a live room map with two zones, two tracked targets, an ignore spot, a doorway and an outside-room area](docs/screenshot.png)
 
 - **Up to 8 software zones.** Draw rectangles on a live map; each one becomes its own occupancy sensor in Home Assistant, named after the zone (a zone called "Desk" gives you "Desk occupancy").
-- **Native sensor zones.** Switch to **Native** to paint the FP400's own detection zones as 0.5 m cells. Their occupancy and people counts come from the sensor, independently of coordinate tracking.
+- **Native sensor zones.** Enable `native_zones` in Zigbee2MQTT's device options, then switch to **Native** to paint the FP400's own detection zones as 0.5 m cells. Their occupancy and people counts come from the sensor, independently of coordinate tracking.
 - **People count and movement per software zone.** Each software zone also tells you how many people are in it and whether they are moving or still, and fires enter/leave events.
 - **Areas, like in the Aqara app.** Paint and erase the sensor's own areas: **ignore spots** (fake targets from a curtain, fan or TV), **doorways** (where people come and go) and **outside room** (behind a wall or a window).
 - **Ghost targets.** Click a dot on the map to make the sensor forget it, or to turn its spot into an ignore spot.
@@ -96,9 +96,9 @@ device: living_room_fp400 # optional
 
 ### Native sensor zones
 
-The card opens in **Software** mode. Select **Native** to edit detection zones computed by the FP400 itself. Save or discard current edits before switching modes; switching does not copy or replace your zones.
+The card opens in **Software** mode. Native zones are optional: enable **native_zones** in the FP400's Zigbee2MQTT device options first, then select **Native** to edit detection zones computed by the FP400 itself. The option is off by default, so software-only installations do not get the 40 native editor entities. Save or discard current edits before switching modes; switching does not copy or replace your zones.
 
-Draw a new zone, then use **Paint / Erase** to adjust its 0.5 m cells, name it, and set its absence timeout. **Save zones** sends only the changed IDs. Each zone retains its exact bitmap, including holes and separate groups of cells. Native zones have their own `native_zone_N_occupancy` and `native_zone_N_count` entities; software entities and enter/leave actions keep their existing meaning.
+Draw a new zone, then use **Paint / Erase** to adjust its 0.5 m cells and name it. **Save zones** sends only the changed IDs. A new zone stays **Saving** while its endpoint initializes (at least 20 seconds); it is confirmed by the next poll. Once saved, change **Empty delay** in the zone details or the existing `zone_N_absence_timeout` number entity. This setting applies immediately and is separate from geometry. Each zone retains its exact bitmap, including holes and separate groups of cells. Native zones have their own `native_zone_N_occupancy` and `native_zone_N_count` entities; software entities and enter/leave actions keep their existing meaning.
 
 **Shape unknown** means the card cannot show confirmed geometry for that ID. Select it explicitly and confirm before replacing or deleting it. A free slot is used for a new zone; other sensor zones are left alone. A failed save keeps your open draft for retry and reports the failure instead of saying Saved.
 

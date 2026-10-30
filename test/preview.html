@@ -5,6 +5,7 @@ import '../dist/fp400-zone-card.js';
 // rotation=<deg> (map turned, converter 0.3) · offline (Zigbee2MQTT down: every entity unavailable)
 // registry (Home Assistant shares its entity registry) · renamed (zone 1's entity IDs renamed by HA, found via the registry)
 // held (no new positions; zones held by the sensor's own presence)
+// native (optional sensor-zone entities enabled) · native_delay=<ms> (new-zone finalization, default 20000)
 const params=new URLSearchParams(location.search),old=params.has('oldconv');
 const device=params.get('prefix')??'0x54ef440000000001',card=document.querySelector('fp400-zone-card'),states={};
 if(params.has('phone'))document.querySelector('main').className='phone';
@@ -14,10 +15,10 @@ if(params.has('renamed'))for(const [d,k,n] of [['text','software_zone_1_config',
 const set=(domain,key,state,attributes={})=>{const id=idOf[`${domain}.${key}`]??`${domain}.${device}_${key}`;keyOf[id]=key;states[id]={state,attributes};};
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 if(params.has('native')){
-    if(params.has('renamed'))idOf['text.native_zone_1_config']='text.kitchen_native_configuration';
+    if(params.has('renamed')){idOf['text.native_zone_1_config']='text.kitchen_native_configuration';idOf['number.zone_1_absence_timeout']='number.kitchen_native_delay';}
     const cells=new Uint8Array(40);for(const bit of [70,71,72,86,88,102,103,104])cells[bit>>3]|=0x80>>(bit%8);
     const mask_hex=[...cells].map(b=>b.toString(16).padStart(2,'0')).join('');
-    for(let i=1;i<=8;i++){set('text',`native_zone_${i}_config`,i===1?JSON.stringify({name:'Sensor desk',mask_hex,absence_timeout:3}):i===2?'unmanaged':'clear');set('sensor',`native_zone_${i}_status`,'ready');set('sensor',`native_zone_${i}_error`,'');set('binary_sensor',`native_zone_${i}_occupancy`,i===1?'on':'unknown');set('sensor',`native_zone_${i}_count`,i===1?'2':'unknown');}
+    for(let i=1;i<=8;i++){set('text',`native_zone_${i}_config`,i===1?JSON.stringify({name:'Sensor desk',mask_hex}):i===2?'unmanaged':'clear');set('sensor',`native_zone_${i}_status`,'ready');set('sensor',`native_zone_${i}_error`,'');set('binary_sensor',`native_zone_${i}_occupancy`,i===1?'on':'unknown');set('sensor',`native_zone_${i}_count`,i===1?'2':'unknown');set('number',`zone_${i}_absence_timeout`,i===1?'10':'unknown',{min:0,max:300,step:1});}
 }
 for(let i=1;i<=8;i++){set('text',`software_zone_${i}_config`,'clear');set('binary_sensor',`software_zone_${i}_occupancy`,'off');set('binary_sensor',`software_zone_${i}_available`,'on');if(!old){set('sensor',`software_zone_${i}_count`,'unknown');set('sensor',`software_zone_${i}_activity`,'unknown');}}
 set('text','software_zone_1_config',JSON.stringify({name:'Desk',x_min:-115,x_max:85,y_min:-19,y_max:131,absence_timeout:3}));
@@ -40,7 +41,7 @@ if(!params.has('nosettings')){
 // and Home Assistant's service call returns before that work finishes.
 const AREAS=['interference','entry_exit','edge'],types=params.has('noblocks')?[]:old?['interference']:AREAS;
 const masks=Object.fromEntries(AREAS.map(t=>[t,new Uint8Array(40)]));
-const sim=window.__sim={latency:Number(params.get('latency')??400),fail:false,keepTargets:false,nativeFail:'',calls:[],shapes:[],ws:[]};
+const sim=window.__sim={latency:Number(params.get('latency')??400),fail:false,keepTargets:false,nativeFail:'',nativeDelay:Number(params.get('native_delay')??20000),calls:[],shapes:[],ws:[]};
 const maskHex=t=>[...masks[t]].map(b=>b.toString(16).padStart(2,'0')).join('');
 function cellBits(r){
     const r0=Math.max(0,Math.floor(r.y_min/50)),r1=Math.min(19,Math.ceil(r.y_max/50)-1);
@@ -74,19 +75,24 @@ const hass={states,user:{is_admin:false},callService:async(domain,service,data)=
     const native=/^native_zone_([1-8])_config$/.exec(key);
     if(domain==='text'&&native){
         if(data.value.length>255)throw new Error('MQTT text exceeds 255 characters');
-        const n=Number(native[1]),value=data.value==='clear'?{clear:true}:JSON.parse(data.value);
+        const n=Number(native[1]),value=data.value==='clear'?{clear:true}:JSON.parse(data.value),creating=states[id].state==='clear'&&!value.clear;
+        if('absence_timeout' in value)throw new Error('Set the zone number entity separately');
         if(states[id].state==='unmanaged'&&!value.overwrite)throw new Error('Confirm overwrite');
         set('text',key,'unmanaged');card.hass={...hass};set('sensor',`native_zone_${n}_status`,'pending');set('sensor',`native_zone_${n}_error`,'');card.hass={...hass};
-        sleep(sim.latency).then(()=>{
+        sleep(creating?sim.nativeDelay:sim.latency).then(()=>{
             if(sim.nativeFail){set('sensor',`native_zone_${n}_status`,'error');set('sensor',`native_zone_${n}_error`,sim.nativeFail);}
-            else {set('text',key,value.clear?'clear':JSON.stringify({name:value.name,mask_hex:value.mask_hex,absence_timeout:value.absence_timeout}));card.hass={...hass};set('sensor',`native_zone_${n}_status`,'ready');}
+            else {set('text',key,value.clear?'clear':JSON.stringify({name:value.name,mask_hex:value.mask_hex}));card.hass={...hass};if(creating||value.clear)set('number',`zone_${n}_absence_timeout`,value.clear?'unknown':'10',{min:0,max:300,step:1});set('sensor',`native_zone_${n}_status`,'ready');}
             card.hass={...hass};
         });
     }
     else if(domain==='text'&&type)convert(type,key.slice(type.length+1),data.value);
     else if(key==='remove_target')later(()=>{states[id]={state:data.value,attributes:{}};if(!sim.keepTargets)set('sensor','targets_xy',states[`sensor.${device}_targets_xy`].state.split(';').filter(t=>t.split(':')[0]!==data.value).join(';')||'none');});
     else if(domain==='select')later(()=>{states[id]={...states[id],state:data.option};});
-    else if(domain==='number')later(()=>{states[id]={...states[id],state:String(data.value)};});
+    else if(domain==='number'){
+        const zone=/^zone_([1-8])_absence_timeout$/.exec(key);
+        if(zone&&states[`sensor.${device}_native_zone_${zone[1]}_status`]?.state==='pending')throw new Error('Native zone is still pending');
+        later(()=>{states[id]={...states[id],state:String(data.value)};});
+    }
     else if(domain==='switch')later(()=>{states[id]={...states[id],state:service==='turn_on'?'on':'off'};});
     else if(domain==='button'){states[id]={...states[id],state:new Date().toISOString()};if(key==='spatial_learning')sleep(sim.latency*3).then(()=>{set('sensor','learning_result_time',new Date().toISOString());card.hass={...hass};});}
     else later(()=>{states[id]={state:data.value,attributes:{}};});

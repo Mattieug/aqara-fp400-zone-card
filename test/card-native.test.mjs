@@ -1,11 +1,11 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {FP400ZoneCard,normalizeNativeZone,maskHex,maskBits} from '../dist/fp400-zone-card.js';
-const zone={name:'Desk',mask_hex:maskHex(new Set([0,1,2,16,18,32,33,34])),absence_timeout:3};
+const zone={name:'Desk',mask_hex:maskHex(new Set([0,1,2,16,18,32,33,34]))};
 function editor(){
-    const c=Object.create(FP400ZoneCard.prototype);Object.assign(c,{zoneMode:'native',config:{device:'fp'},saved:{1:zone,2:'unmanaged',3:null},drafts:{1:{...zone,name:'Office'},2:'unmanaged',3:null},base:{1:zone},dirty:new Set([1]),loaded:new Set([1,2,3]),selected:1,saving:false,pendingAreas:[],pendingClears:new Set(),overwriteNative:new Set(),render(){},notice(text){this.message=text;}});
+    const c=Object.create(FP400ZoneCard.prototype);Object.assign(c,{zoneMode:'native',config:{device:'fp'},saved:{1:zone,2:'unmanaged',3:null},drafts:{1:{...zone,name:'Office'},2:'unmanaged',3:null},base:{1:zone},dirty:new Set([1]),loaded:new Set([1,2,3]),selected:1,saving:false,busy:{},pendingAreas:[],pendingClears:new Set(),overwriteNative:new Set(),render(){},notice(text){this.message=text;}});
     const states={};c._hass={states,user:{is_admin:false},callService:async()=>{}};
-    for(const [id,z] of Object.entries(c.saved)){states[`text.fp_native_zone_${id}_config`]={state:z===null?'clear':typeof z==='string'?z:JSON.stringify(z)};states[`sensor.fp_native_zone_${id}_status`]={state:'ready'};}
+    for(const [id,z] of Object.entries(c.saved)){states[`text.fp_native_zone_${id}_config`]={state:z===null?'clear':typeof z==='string'?z:JSON.stringify(z)};states[`sensor.fp_native_zone_${id}_status`]={state:'ready'};states[`number.fp_zone_${id}_absence_timeout`]={state:id==='1'?'10':'unknown',attributes:{min:0,max:300,step:1}};}
     return c;
 }
 function publish(c,id,z,status='ready',error=''){
@@ -15,7 +15,7 @@ function publish(c,id,z,status='ready',error=''){
     c.sync();
 }
 function syncable(c){
-    for(const f of ['renderList','renderInspector','renderMap','renderLive','renderButtons'])c[f]=()=>{};
+    for(const f of ['renderList','renderInspector','renderMap','renderLive','renderButtons','renderSettings'])c[f]=()=>{};
     c.shadowRoot={querySelector:()=>({contains:()=>false})};return c;
 }
 test('native shape is preserved exactly, including holes and disconnected cells',()=>{
@@ -34,7 +34,7 @@ test('native save waits beyond the HA service response and keeps exact mask byte
     const c=syncable(editor()),sent=[];let returned=false;
     c._hass.callService=async(d,s,data)=>{sent.push(data);publish(c,1,'unmanaged','pending');setTimeout(()=>{returned=true;publish(c,1,JSON.parse(data.value));},30);};
     const saving=c.save();assert.equal(c.saving,true);assert.equal(returned,false);assert.equal(c.dirty.has(1),true);
-    await saving;assert.equal(sent[0].entity_id,'text.fp_native_zone_1_config');assert.equal(JSON.parse(sent[0].value).mask_hex,zone.mask_hex);assert.equal(c.dirty.size,0);assert.match(c.message,/Native zones/);
+    await saving;assert.equal(sent[0].entity_id,'text.fp_native_zone_1_config');assert.deepEqual(JSON.parse(sent[0].value),{name:'Office',mask_hex:zone.mask_hex});assert.equal(c.dirty.size,0);assert.match(c.message,/Native zones/);
 });
 test('unmanaged overwrite and deletion require explicit confirmation of that slot',async()=>{
     const c=syncable(editor());c.dirty=new Set([2]);c.base={2:'unmanaged'};c.drafts[2]={...zone,name:'Replacement'};
@@ -91,4 +91,36 @@ test('a concrete native configuration changed elsewhere still blocks stale edits
     const c=syncable(editor());let calls=0;c._hass.callService=async()=>{calls++;};
     publish(c,1,{...zone,name:'Other dashboard'});
     await c.save();assert.equal(calls,0);assert.match(c.message,/changed elsewhere/);assert.equal(c.drafts[1].name,'Office');
+});
+
+test('native timeout writes the existing renamed number entity without changing geometry',async()=>{
+    const c=syncable(editor()),sent=[],id='number.kitchen_delay';
+    c.fp={label:'fp',keys:{'number.zone_1_absence_timeout':id}};
+    c._hass.states[id]=c._hass.states['number.fp_zone_1_absence_timeout'];delete c._hass.states['number.fp_zone_1_absence_timeout'];
+    c._hass.callService=async(domain,service,data)=>{sent.push({domain,service,...data});setTimeout(()=>{c._hass.states[id]={...c._hass.states[id],state:String(data.value)};c.sync();},30);};
+    const pending=c.applySetting({dataset:{setting:id,nativeTimeout:'1'},value:'25'},['number','zone_1_absence_timeout','Zone 1 empty delay',{unit:'s',min:0}]);
+    assert.equal(c.busy[id],true);
+    await c.save();assert.equal(sent.length,1);assert.match(c.message,/confirm the zone empty delay/);
+    await pending;
+    assert.deepEqual(sent,[{domain:'number',service:'set_value',entity_id:id,value:25}]);
+    assert.equal(c.saved[1].name,'Desk');assert.equal(c.drafts[1].name,'Office');assert.equal(c.dirty.has(1),true);
+    assert.equal(c.state('number','zone_1_absence_timeout'),'25');
+    await c.applySetting({dataset:{setting:id,nativeTimeout:'1'},value:'301'},['number','zone_1_absence_timeout','Zone 1 empty delay',{unit:'s',min:0}]);
+    assert.equal(sent.length,1);assert.match(c.message,/0 to 300/);
+});
+test('native timeout cannot write a new or pending zone before numeric state is ready',async()=>{
+    const c=syncable(editor());let calls=0;c._hass.callService=async()=>{calls++;};
+    const input={dataset:{setting:'number.fp_zone_3_absence_timeout',nativeTimeout:'3'},value:'25'},descriptor=['number','zone_3_absence_timeout','Zone 3 empty delay',{unit:'s',min:0}];
+    c.drafts[3]=zone;c.dirty.add(3);c.base[3]=null;
+    await c.applySetting(input,descriptor);assert.equal(calls,0);
+    publish(c,3,'unmanaged','pending');c._hass.states['number.fp_zone_3_absence_timeout'].state='10';
+    await c.applySetting(input,descriptor);assert.equal(calls,0);
+    publish(c,3,zone);assert.equal(c.nativeTimeoutReady(3),true);
+});
+test('missing optional native controls keep software mode and retain existing native drafts',()=>{
+    const c=syncable(editor());c.zoneMode='software';c.dirty.clear();
+    for(const id of Object.keys(c._hass.states))if(id.includes('_native_zone_'))delete c._hass.states[id];
+    c.switchZones();assert.equal(c.native,false);assert.match(c.message,/Enable native_zones/);
+    c.zoneMode='native';c.dirty.add(1);c.sync();
+    assert.equal(c.drafts[1].name,'Office');assert.equal(c.nativeEditable(1),false);assert.equal(c.freeId(),null);assert.match(c.message,/discard edits/);
 });

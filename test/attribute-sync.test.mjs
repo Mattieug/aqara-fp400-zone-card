@@ -18,10 +18,10 @@ test('all 20 captured 8A reports reach the prepared standard and native converte
         await readNativeZoneMap(device);
         const published = [], meta = {device, state: {}, publish: state => published.push(state)};
         const message = {cluster, type: 'raw', data: raw, endpoint: device.getEndpoint(vector.endpoint), device, meta: {rawData: raw}};
-        const state = await bridge(cluster).convert(model, message, meta.publish, {}, meta);
+        const state = await bridge(cluster).convert(model, message, meta.publish, {native_zones: true}, meta);
         const ordinary = {}, report = {...message, type: 'attributeReport', data: decodeAttributeSync(cluster, raw)};
         for (const converter of model.fromZigbee.filter(c => c.cluster === cluster && c.type.includes('attributeReport'))) {
-            Object.assign(ordinary, await converter.convert(model, report, meta.publish, {}, meta));
+            Object.assign(ordinary, await converter.convert(model, report, meta.publish, {native_zones: true}, meta));
         }
         assert.deepEqual(state, ordinary, `${capture.session} frame ${vector.frame}`);
         if (cluster === 'msOccupancySensing') {
