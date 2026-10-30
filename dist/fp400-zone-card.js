@@ -282,6 +282,7 @@ export class FP400ZoneCard extends (globalThis.HTMLElement ?? class {}) {
         for(let i=1;i<=8;i++)keys.push(['text',`software_zone_${i}_config`],['binary_sensor',`software_zone_${i}_occupancy`],['binary_sensor',`software_zone_${i}_available`],['sensor',`software_zone_${i}_count`],['sensor',`software_zone_${i}_activity`]);
         for(let i=1;i<=8;i++)keys.push(['text',`native_zone_${i}_config`],['sensor',`native_zone_${i}_status`],['sensor',`native_zone_${i}_error`],['binary_sensor',`native_zone_${i}_occupancy`],['sensor',`native_zone_${i}_count`],['number',`zone_${i}_absence_timeout`]);
         for(const [,items] of SETTINGS)for(const [domain,key] of items)keys.push([domain,key]);
+        keys.push(['sensor','learning_state'],['sensor','learning_result_code']);
         return keys.map(([domain,key])=>this.entity(domain,key));
     }
     get hass(){return this._hass;}
@@ -317,14 +318,14 @@ export class FP400ZoneCard extends (globalThis.HTMLElement ?? class {}) {
                 try{data=JSON.parse(message.payload);}catch{return;}
                 if(!data||typeof data!=='object'||Array.isArray(data))return;
                 const keys=['targets_xy','tracking_last_update','tracking_status',
-                    'interference_mask_hex','entry_exit_mask_hex','edge_mask_hex','learning_result_time']
+                    'interference_mask_hex','entry_exit_mask_hex','edge_mask_hex','learning_result_time','learning_state','learning_result_code']
                     .filter(key=>Object.hasOwn(data,key));
                 if(!keys.length)return;
                 const next={...this.liveTracking};let editorChanged=false,positionsChanged=false;
                 for(const key of keys){
                     if(next[key]===data[key])continue;
                     next[key]=data[key];
-                    if(key.endsWith('_mask_hex')||key==='learning_result_time')editorChanged=true;
+                    if(key.endsWith('_mask_hex')||key.startsWith('learning_'))editorChanged=true;
                     else positionsChanged=true;
                 }
                 if(!editorChanged&&!positionsChanged)return;
@@ -354,7 +355,7 @@ export class FP400ZoneCard extends (globalThis.HTMLElement ?? class {}) {
         return null;
     }
     connectedCallback(){this.clock??=setInterval(()=>{if(this.mounted)this.renderLive();},1000);if(this.mounted)this.resizeObs?.observe(this.svg);void this.ensureTrackingSubscription();}
-    disconnectedCallback(){clearInterval(this.clock);this.clock=null;clearTimeout(this.learnTimer);this.resizeObs?.disconnect();this.stopTrackingSubscription();}
+    disconnectedCallback(){clearInterval(this.clock);this.clock=null;clearTimeout(this.learnTimer);clearTimeout(this.learnResultTimer);this.learnBefore=undefined;this.resizeObs?.disconnect();this.stopTrackingSubscription();}
     entity(domain,key){return this.fp?.keys?.[`${domain}.${key}`]??`${domain}.${this.device}_${key}`;}
     state(domain,key){return this._hass?.states?.[this.entity(domain,key)]?.state;}
     available(domain,key){return !['unavailable',undefined].includes(this.state(domain,key));}
@@ -411,7 +412,7 @@ export class FP400ZoneCard extends (globalThis.HTMLElement ?? class {}) {
         const areas=Object.keys(AREAS).map(t=>`${this.areaMask(t)}${this.areaReady(t)}${this.available('text',`${t}_zone_remove`)}`).join();
         if(areas!==this.lastAreas){this.lastAreas=areas;changed=true;}
         // The result time comes from the server's clock, so watch for it to change rather than comparing clocks.
-        if(this.learnBefore!==undefined&&this.trackingValue('learning_result_time')!==this.learnBefore){this.learnBefore=undefined;this.notice('Room learning finished.','success');}
+        this.checkLearningResult();
         if(!this.drag){if(changed)this.renderList();if((changed||this.native)&&!this.inside('#inspector'))this.renderInspector();}
         if(this.native&&!this.hasNativeControls())this.notice('Native zone controls are unavailable. Enable native_zones in Zigbee2MQTT, or discard edits to return to software zones.','error');
         if(this.panel==='settings'&&!this.inside('#settings'))this.renderSettings();
@@ -764,7 +765,7 @@ export class FP400ZoneCard extends (globalThis.HTMLElement ?? class {}) {
         if(!this.mounted||this.panel!=='settings')return;
         const groups=SETTINGS.map(([title,items])=>{const rows=items.map(item=>this.settingRow(...item)).join('');return rows?`<h2 class="section-title">${title.toUpperCase()}</h2>${rows}`:'';}).join('');
         const learned=Date.parse(this.trackingValue('learning_result_time')),room=[];
-        if(this.available('button','spatial_learning'))room.push(`<button class="btn" data-action="learn">${this.learnArmed?'Room empty? Press again to start':'Learn the empty room'}</button><p class="small-note">Teaches the sensor what your empty room looks like. ${Number.isFinite(learned)?`Last done ${new Date(learned).toLocaleString()}.`:''}</p>`);
+        if(this.available('button','spatial_learning'))room.push(`<button class="btn" data-action="learn">${this.learnArmed?'Room empty? Press again to start':'Learn the empty room'}</button><p class="small-note">Teaches the sensor what your empty room looks like. ${Number.isFinite(learned)?`Last result ${new Date(learned).toLocaleString()}.`:''}</p>`);
         if(this.available('button','refresh_configuration'))room.push(`<button class="btn" data-action="refresh">Read settings from the sensor</button>`);
         setHtml(this.shadowRoot.querySelector('#settings'),`<div class="settings-head"><h2 class="section-title">SENSOR SETTINGS</h2><button class="btn icon" data-action="settings" aria-label="Close settings">✕</button></div>${groups||'<div class="empty">No settings found. Update the FP400 converter in Zigbee2MQTT.</div>'}${room.length?`<h2 class="section-title">ROOM</h2>${room.join('')}`:''}<p class="small-note">Changes apply right away.</p>`);
     }
@@ -805,12 +806,27 @@ export class FP400ZoneCard extends (globalThis.HTMLElement ?? class {}) {
         catch(error){this.notice(error?.message??String(error),'error');return false;}
     }
     // Learning needs an empty room, so the first press only asks.
+    checkLearningResult(){
+        const time=this.trackingValue('learning_result_time');
+        if(this.learnBefore===undefined||typeof time!=='string'||!time.endsWith('Z')||!Number.isFinite(Date.parse(time))||Date.parse(time)<=Date.parse(this.learnBefore)||this.trackingValue('learning_state')!=='result_received')return false;
+        const code=this.trackingValue('learning_result_code');
+        if(code==null||code===''||!Number.isInteger(Number(code))||Number(code)<0||Number(code)>255)return false;
+        clearTimeout(this.learnResultTimer);this.learnBefore=undefined;
+        this.notice(`Room learning result received (code ${Number(code)}). The code's meaning has not been verified.`);
+        return true;
+    }
     async learn(){
+        if(this.learnBefore!==undefined)return;
         clearTimeout(this.learnTimer);
-        if(!this.learnArmed){this.learnArmed=true;this.learnTimer=setTimeout(()=>{this.learnArmed=false;this.renderSettings();},8000);this.notice('Leave the room empty, then press again. It takes about 10 seconds.');this.renderSettings();return;}
+        if(!this.learnArmed){this.learnArmed=true;this.learnTimer=setTimeout(()=>{this.learnArmed=false;this.renderSettings();},8000);this.notice('Leave the room empty, then press again. Wait for a result from the sensor.');this.renderSettings();return;}
         this.learnArmed=false;this.renderSettings();
-        const before=this.trackingValue('learning_result_time');
-        if(await this.press('spatial_learning','Learning the room. Stay out for about 10 seconds.'))this.learnBefore=before;
+        this.learnBefore=this.trackingValue('learning_result_time')??'';
+        try{
+            await this._hass.callService('button','press',{entity_id:this.entity('button','spatial_learning')});
+            if(this.learnBefore===undefined||this.checkLearningResult())return;
+            this.notice('Learning requested. Keep the room empty while waiting for the sensor result.');
+            this.learnResultTimer=setTimeout(()=>{this.learnBefore=undefined;this.notice('No learning result received yet. Read the sensor settings before trying again.','error');},30000);
+        }catch(error){this.learnBefore=undefined;this.notice(error?.message??String(error),'error');}
     }
     // The sensor drops the track; a real person is picked up again within seconds.
     async forgetTarget(id){
