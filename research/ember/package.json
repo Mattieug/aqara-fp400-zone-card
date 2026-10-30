@@ -1,0 +1,16 @@
+{
+  "name": "fp400-ember-fragmentation-lab",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Offline reproduction of the experimental receive-fragment patch; never installs on a coordinator",
+  "scripts": {
+    "prepare:experiment": "node prepare.cjs",
+    "test": "node --test adapter.test.cjs",
+    "typecheck": "tsc --noEmit --module Node16 --moduleResolution Node16 --esModuleInterop --strict --target ES2022 --skipLibCheck --types node node_modules/zigbee-herdsman/dist/adapter/ember/adapter/emberAdapter.experimental.ts"
+  },
+  "devDependencies": {
+    "zigbee-herdsman": "10.10.0",
+    "typescript": "5.7.3",
+    "@types/node": "22.10.0"
+  }
+}

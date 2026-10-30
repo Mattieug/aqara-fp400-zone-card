@@ -106,7 +106,10 @@
         "cluster": "0x0400",
         "zclHex": "1c5f111a8a000021661e"
       }
-    ]
+    ],
+    "firmware": null,
+    "source": "https://github.com/bobtekkk/aqara-fp400-zone-card/pull/9",
+    "firmware_note": "Not recorded in this extracted fixture. Do not infer a firmware from a different hardware test."
   },
   {
     "session": "fp400-m3-coordinates-20261022-192810Z",
@@ -140,6 +143,9 @@
         "attribute": "measuredValue",
         "expected": 0
       }
-    ]
+    ],
+    "firmware": null,
+    "source": "https://github.com/bobtekkk/aqara-fp400-zone-card/pull/9",
+    "firmware_note": "Not recorded in this extracted fixture. Do not infer a firmware from a different hardware test."
   }
 ]

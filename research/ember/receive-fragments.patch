@@ -1,0 +1,168 @@
+--- a/src/adapter/ember/adapter/emberAdapter.ts
++++ b/src/adapter/ember/adapter/emberAdapter.ts
+@@ -76,6 +76,14 @@
+ 
+ const NS = "zh:ember";
+ 
++// Experimental receive-only port of Homey SHS PR #10; no outgoing fragmentation/config changes.
++const APS_FRAGMENT_TTL_MS = 10_000;
++const APS_FRAGMENT_MAX_ACTIVE = 16;
++const APS_FRAGMENT_MAX_COMPLETED = 128;
++const APS_FRAGMENT_MAX_BYTES = 4096;
++type ApsFragmentMessage = {total: number; blocks: Buffer[]; bytes: number; startedAt: number; options: number};
++type ApsCompletedFragment = {total: number; first: Buffer; last: Buffer; startedAt: number};
++
+ export type NetworkCache = {
+     //-- basic network info
+     eui64: Eui64;
+@@ -230,6 +238,8 @@
+     public readonly stackConfig: StackConfig;
+ 
+     private ezsp: Ezsp;
++    private readonly apsFragments = new Map<string, ApsFragmentMessage>();
++    private readonly apsCompletedFragments = new Map<string, ApsCompletedFragment>();
+     private version: {ezsp: number; revision: string} & EmberVersion;
+ 
+     private readonly queue: Queue;
+@@ -547,6 +557,102 @@
+      * @param sender
+      * @param messageContents
+      */
++    /** Experimental host-side receive window of one block; see Homey SHS PR #10. */
++    private reassembleApsFragment(
++        type: EmberIncomingMessageType,
++        apsFrame: EmberApsFrame,
++        sender: NodeId,
++        messageContents: Buffer,
++    ): {apsFrame: EmberApsFrame; messageContents: Buffer} | undefined {
++        if (!(apsFrame.options & EmberApsOption.FRAGMENT)) return {apsFrame, messageContents};
++        // FRAGMENT is valid only for unicasts. Never send fragment ACKs for a broadcast/group.
++        if (type !== EmberIncomingMessageType.UNICAST && type !== EmberIncomingMessageType.UNICAST_REPLY) return;
++
++        const now = performance.now();
++        for (const [key, message] of this.apsFragments) {
++            if (now - message.startedAt >= APS_FRAGMENT_TTL_MS) this.apsFragments.delete(key);
++        }
++        for (const [key, message] of this.apsCompletedFragments) {
++            if (now - message.startedAt >= APS_FRAGMENT_TTL_MS) this.apsCompletedFragments.delete(key);
++        }
++
++        const index = apsFrame.groupId & 0xff;
++        const total = apsFrame.groupId >>> 8;
++        const key = [sender, type, apsFrame.profileId, apsFrame.clusterId,
++            apsFrame.sourceEndpoint, apsFrame.destinationEndpoint, apsFrame.sequence].join(":");
++        if (messageContents.length === 0 || messageContents.length > APS_FRAGMENT_MAX_BYTES) return;
++
++        const finished = this.apsCompletedFragments.get(key);
++        if (finished) {
++            if (index === finished.total - 1 && messageContents.equals(finished.last) &&
++                (index !== 0 || total === finished.total)) {
++                this.acknowledgeApsFragment(sender, apsFrame, index);
++                return;
++            }
++            // A changed block 0 can begin a genuinely new message after APS sequence reuse.
++            // Exact replay of a completed block 0 is not delivered again during the cache window.
++            if (index !== 0 || (total === finished.total && messageContents.equals(finished.first))) return;
++            this.apsCompletedFragments.delete(key);
++        }
++
++        let message = this.apsFragments.get(key);
++        if (!message) {
++            if (index !== 0 || total === 0 || total > 255 || this.apsFragments.size >= APS_FRAGMENT_MAX_ACTIVE ||
++                messageContents.length * (total - 1) + 1 > APS_FRAGMENT_MAX_BYTES) return;
++            message = {total, blocks: [], bytes: 0, startedAt: now, options: apsFrame.options};
++            this.apsFragments.set(key, message);
++        }
++
++        if (message.options !== apsFrame.options || (index === 0 && total !== message.total)) {
++            this.apsFragments.delete(key);
++            return;
++        }
++        if (index === message.blocks.length - 1) {
++            // A duplicate must really be the same block; never ACK a conflicting payload.
++            if (!messageContents.equals(message.blocks[index])) {
++                this.apsFragments.delete(key);
++                return;
++            }
++            this.acknowledgeApsFragment(sender, apsFrame, index);
++            return;
++        }
++        if (index !== message.blocks.length || index >= message.total) return;
++        if (index > 0 && (messageContents.length > message.blocks[0].length ||
++            (index < message.total - 1 && messageContents.length !== message.blocks[0].length))) {
++            this.apsFragments.delete(key);
++            return;
++        }
++        if (message.bytes + messageContents.length > APS_FRAGMENT_MAX_BYTES) {
++            this.apsFragments.delete(key);
++            return;
++        }
++        message.blocks.push(Buffer.from(messageContents));
++        message.bytes += messageContents.length;
++        this.acknowledgeApsFragment(sender, apsFrame, index);
++        if (message.blocks.length !== message.total) return;
++
++        // Finished records cannot occupy one of the 16 active reassembly slots.
++        this.apsFragments.delete(key);
++        if (this.apsCompletedFragments.size >= APS_FRAGMENT_MAX_COMPLETED) {
++            const oldest = this.apsCompletedFragments.keys().next().value;
++            if (oldest !== undefined) this.apsCompletedFragments.delete(oldest);
++        }
++        this.apsCompletedFragments.set(key, {total: message.total, startedAt: message.startedAt,
++            first: message.blocks[0], last: message.blocks[message.total - 1]});
++        return {apsFrame: {...apsFrame, options: apsFrame.options & ~EmberApsOption.FRAGMENT, groupId: 0},
++            messageContents: Buffer.concat(message.blocks, message.bytes)};
++    }
++
++    private acknowledgeApsFragment(sender: NodeId, apsFrame: EmberApsFrame, index: number): void {
++        // One-block receive window: all bits set in the high byte, block index in the low byte.
++        // Send directly through EZSP, as in the reference implementation, to avoid adapter-queue delay.
++        void this.ezsp.ezspSendReply(sender, {...apsFrame, groupId: 0xff00 | index}, Buffer.alloc(0))
++            .then((status) => {
++                if (status !== SLStatus.OK) logger.warning(`APS fragment ACK to ${sender} failed: ${SLStatus[status]}`, NS);
++            })
++            .catch((error) => logger.warning(`APS fragment ACK to ${sender} failed: ${error}`, NS));
++    }
++
+     private onIncomingMessage(
+         type: EmberIncomingMessageType,
+         apsFrame: EmberApsFrame,
+@@ -554,6 +660,10 @@
+         sender: NodeId,
+         messageContents: Buffer,
+     ): void {
++        const assembled = this.reassembleApsFragment(type, apsFrame, sender, messageContents);
++        if (!assembled) return;
++        apsFrame = assembled.apsFrame;
++        messageContents = assembled.messageContents;
+         const payload: ZclPayload = {
+             clusterID: apsFrame.clusterId,
+             header: Zcl.Header.fromBuffer(messageContents),
+@@ -668,6 +778,8 @@
+      * This is called by start and on internal reset.
+      */
+     private async initEzsp(): Promise<TsType.StartResult> {
++        this.apsFragments.clear();
++        this.apsCompletedFragments.clear();
+         let result: TsType.StartResult = "resumed";
+ 
+         // NOTE: something deep in this call can throw too
+@@ -1309,6 +1421,8 @@
+      * @param status
+      */
+     private onNcpNeedsResetAndInit(_status: EzspStatus): void {
++        this.apsFragments.clear();
++        this.apsCompletedFragments.clear();
+         this.emit("disconnected");
+     }
+ 
+@@ -1561,6 +1675,8 @@
+     }
+ 
+     public async stop(): Promise<void> {
++        this.apsFragments.clear();
++        this.apsCompletedFragments.clear();
+         clearInterval(this.watchdogCountersHandle);
+         await this.ezsp.stop();
+         this.ezsp.removeAllListeners();
+

@@ -1,5 +1,7 @@
 # Aqara FP400 Zone Card
 
+> Development branch **0.6.0-dev.1**: integrates PR #7 then #9 and further fixes. Software-tested; new catalogue/recovery behavior is not hardware-validated. Use the matched card/converter pair. See [development features and rollback](docs/experimental-development.md) and [validation](docs/validation-and-hardware.md).
+
 [![HACS Default](https://img.shields.io/badge/HACS-Default-41BDF5.svg)](https://hacs.xyz)
 [![Validate](https://github.com/bobtekkk/aqara-fp400-zone-card/actions/workflows/validate.yml/badge.svg)](https://github.com/bobtekkk/aqara-fp400-zone-card/actions/workflows/validate.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)

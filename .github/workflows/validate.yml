@@ -34,3 +34,17 @@ jobs:
       - run: npm ci --ignore-scripts
       - run: npx --no-install playwright-core install --with-deps chromium-headless-shell
       - run: npm run e2e
+
+  ember-laboratory:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - run: npm ci --ignore-scripts
+      - run: npm ci --ignore-scripts
+        working-directory: research/ember
+      - run: npm run prepare:experiment && npm test && npm run typecheck
+        working-directory: research/ember
